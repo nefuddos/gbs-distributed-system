@@ -1,0 +1,15 @@
+# icecc pkg-config file
+
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: icecc
+Description: icecc is a library for connecting to icecc schedulers
+Version: 1.1rc3
+Requires:
+Conflicts:
+Libs: -L${libdir} -licecc
+Libs.private: -lcap-ng -llzo2
+Cflags: -I${includedir}

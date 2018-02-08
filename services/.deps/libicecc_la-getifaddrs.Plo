@@ -1,0 +1,6 @@
+libicecc_la-getifaddrs.lo: getifaddrs.cpp /usr/include/stdc-predef.h \
+ ../config.h
+
+/usr/include/stdc-predef.h:
+
+../config.h:

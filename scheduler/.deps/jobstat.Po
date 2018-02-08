@@ -1,0 +1,5 @@
+jobstat.o: jobstat.cpp /usr/include/stdc-predef.h jobstat.h
+
+/usr/include/stdc-predef.h:
+
+jobstat.h:
