@@ -6,7 +6,6 @@ SUBDIRS = \
 	services \
 	daemon \
 	client \
-	doc \
 	suse \
 	compilerwrapper \
 	scheduler \
