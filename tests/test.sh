@@ -5,26 +5,52 @@ testdir="$2"
 shift
 shift
 valgrind=
-builddir=
+builddir=.
+strict=
 
 usage()
 {
-    echo Usage: "$0 <install_prefix> <testddir> [--builddir=dir] [--valgrind[=command]]"
+    echo Usage: "$0 <install_prefix> <testddir> [--builddir=dir] [--valgrind[=command]] [--strict[=value]]"
     exit 3
+}
+
+get_default_valgrind_flags()
+{
+    default_valgrind_args="--num-callers=50 --suppressions=valgrind_suppressions --log-file=$testdir/valgrind-%p.log"
+    # Check if valgrind knows --error-markers, which makes it simpler to find out if log contains any error.
+    valgrind_error_markers="--error-marker2s=ICEERRORBEGIN,ICEERROREND"
+    valgrind $valgrind_error_markers true 2>/dev/null
+    if test $? -eq 0; then
+        default_valgrind_args="$default_valgrind_args $valgrind_error_markers"
+    else
+        valgrind_error_markers=
+    fi
 }
 
 while test -n "$1"; do
     case "$1" in
-        --valgrind)
-            valgrind="valgrind --leak-check=no --error-exitcode=10 --suppressions=valgrind_suppressions --log-file=$testdir/valgrind-%p.log --"
-            rm -f "$testdir"/valgrind-*.log
+        --valgrind|--valgrind=1)
+            get_default_valgrind_flags
+            valgrind="valgrind --leak-check=no $default_valgrind_args --"
+            ;;
+        --valgrind=)
+            # when invoked from Makefile, no valgrind
             ;;
         --valgrind=*)
-            valgrind="`echo $1 | sed 's/^--valgrind=//'` --error-exitcode=10 --suppressions=valgrind_suppressions --log-file=$testdir/valgrind-%p.log --"
-            rm -f "$testdir"/valgrind-*.log
+            get_default_valgrind_flags
+            valgrind="${1#--valgrind=} $default_valgrind_args --"
             ;;
         --builddir=*)
-            builddir=`echo $1 | sed 's/^--builddir=//'`
+            builddir="${1#--builddir=}"
+            ;;
+        --strict)
+            strict=1
+            ;;
+        --strict=*)
+            strict="${1#--strict=}"
+            if test "$strict" = "0"; then
+                strict=
+            fi
             ;;
         *)
             usage
@@ -33,14 +59,20 @@ while test -n "$1"; do
     shift
 done
 
+. $builddir/test-setup.sh
+if test $? -ne 0; then
+    echo Error sourcing test-setup.sh file, aborting.
+    exit 4
+fi
+
 icecc="${prefix}/bin/icecc"
 iceccd="${prefix}/sbin/iceccd"
 icecc_scheduler="${prefix}/sbin/icecc-scheduler"
-if [[ -n "${builddir}" ]]; then
-    icecc="${builddir}/../client/icecc"
-    iceccd="${builddir}/../daemon/iceccd"
-    icecc_scheduler="${builddir}/../scheduler/icecc-scheduler"
-fi
+icecc_create_env="${prefix}/bin/icecc-create-env"
+icecc_test_env="${prefix}/bin/icecc-test-env"
+icerun="${prefix}/bin/icerun"
+netname="icecctestnetname$$"
+protocolversion=$(grep '#define PROTOCOL_VERSION ' ../services/comm.h | sed 's/#define PROTOCOL_VERSION //')
 
 if test -z "$prefix" -o ! -x "$icecc"; then
     usage
@@ -62,35 +94,78 @@ unset ICECC_REPEAT_RATE
 unset ICECC_PREFERRED_HOST
 unset ICECC_CC
 unset ICECC_CXX
+unset ICECC_REMOTE_CPP
 unset ICECC_CLANG_REMOTE_CPP
 unset ICECC_IGNORE_UNVERIFIED
 unset ICECC_EXTRAFILES
 unset ICECC_COLOR_DIAGNOSTICS
 unset ICECC_CARET_WORKAROUND
 
-GCC=/usr/bin/gcc
-GXX=/usr/bin/g++
-CLANG=/usr/bin/clang
-CLANGXX=/usr/bin/clang++
-
 mkdir -p "$testdir"
 
 skipped_tests=
 chroot_disabled=
 
-debug_fission_disabled=
-$GXX -E -gsplit-dwarf messages.cpp 2>/dev/null >/dev/null || debug_fission_disabled=1
-if test -n "$debug_fission_disabled"; then
-    skipped_tests="$skipped_tests split-dwarf(g++)"
-fi
+flush_log_mark=1
+last_reset_log_mark=
+last_section_log_mark=
+
+check_compilers()
+{
+    if test -z "$TESTCC"; then
+        if cc -v >/dev/null 2>/dev/null; then
+            TESTCC=/usr/bin/cc
+        elif gcc -v >/dev/null 2>/dev/null; then
+            TESTCC=/usr/bin/gcc
+        elif clang -v >/dev/null 2>/dev/null; then
+            TESTCC=/usr/bin/clang
+        else
+            echo Cannot find gcc or clang, explicitly set TESTCC.
+            exit 5
+        fi
+    fi
+    if test -z "$TESTCXX"; then
+        if c++ -v >/dev/null 2>/dev/null; then
+            TESTCXX=/usr/bin/c++
+        elif g++ -v >/dev/null 2>/dev/null; then
+            TESTCXX=/usr/bin/g++
+        elif clang -v >/dev/null 2>/dev/null; then
+            TESTCXX=/usr/bin/clang++
+        else
+            echo Cannot find g++ or clang++, explicitly set TESTCXX.
+            exit 5
+        fi
+    fi
+    using_gcc=
+    if $TESTCC -v 2>&1 | grep ^gcc >/dev/null; then
+        using_gcc=1
+    fi
+    using_clang=
+    if $TESTCC --version | grep clang >/dev/null; then
+        using_clang=1
+    fi
+    echo Using C compiler: $TESTCC
+    $TESTCC --version
+    if test $? -ne 0; then
+        echo Compiler $TESTCC failed.
+        exit 5
+    fi
+    echo Using C++ compiler: $TESTCXX
+    $TESTCXX --version
+    if test $? -ne 0; then
+        echo Compiler $TESTCXX failed.
+        exit 5
+    fi
+    if test -z "$using_gcc" -a -z "$using_clang"; then
+        echo "Unknown compiler type (neither GCC nor Clang), aborting."
+        exit 5
+    fi
+    echo
+}
 
 abort_tests()
 {
-    for logfile in "$testdir"/*.log*; do
-        echo "Log file: ${logfile}"
-        cat ${logfile}
-    done
-
+    dump_logs
     exit 2
 }
 
@@ -98,25 +173,12 @@ start_iceccd()
 {
     name=$1
     shift
-    ICECC_TEST_SOCKET="$testdir"/socket-${name} $valgrind "${iceccd}" -s localhost:8767 -b "$testdir"/envs-${name} -l "$testdir"/${name}.log -N ${name}  -v -v -v "$@" 2>>"$testdir"/iceccdstderr_${name}.log &
+    ICECC_TEST_SOCKET="$testdir"/socket-${name} ICECC_SCHEDULER=:8767 ICECC_TESTS=1 ICECC_TEST_SCHEDULER_PORTS=8767:8769 \
+        ICECC_TEST_FLUSH_LOG_MARK="$testdir"/flush_log_mark.txt ICECC_TEST_LOG_HEADER="$testdir"/log_header.txt \
+        $valgrind "${iceccd}" -b "$testdir"/envs-${name} -l "$testdir"/${name}.log -n ${netname} -N ${name}  -v -v -v "$@" &
     pid=$!
-    wait_for_proc_sleep 10 ${pid}
     eval ${name}_pid=${pid}
     echo ${pid} > "$testdir"/${name}.pid
-}
-
-wait_for_proc_sleep()
-{
-    local wait_timeout=$1
-    shift
-    local pid_list="$@"
-    local proc_count=$#
-    local ps_state_field="state"
-    for wait_count in $(seq 1 ${wait_timeout}); do
-        local int_sleep_count=$(ps -ho ${ps_state_field} -p ${pid_list} | grep --count "S")
-        ((${int_sleep_count} == ${proc_count})) && break
-        sleep 1
-    done
 }
 
 kill_daemon()
@@ -144,7 +206,9 @@ kill_daemon()
 
 start_ice()
 {
-    $valgrind "${icecc_scheduler}" -p 8767 -l "$testdir"/scheduler.log -v -v -v &
+    ICECC_TESTS=1 ICECC_TEST_SCHEDULER_PORTS=8767:8769 \
+        ICECC_TEST_FLUSH_LOG_MARK="$testdir"/flush_log_mark.txt ICECC_TEST_LOG_HEADER="$testdir"/log_header.txt \
+        $valgrind "${icecc_scheduler}" -p 8767 -l "$testdir"/scheduler.log -n ${netname} -v -v -v &
     scheduler_pid=$!
     echo $scheduler_pid > "$testdir"/scheduler.pid
 
@@ -152,46 +216,10 @@ start_ice()
     start_iceccd remoteice1 -p 10246 -m 2
     start_iceccd remoteice2 -p 10247 -m 2
 
-    notready=
-    if test -n "$valgrind"; then
-        sleep 10
-    else
-        sleep 1
-    fi
-    for time in `seq 1 10`; do
-        notready=
-        if ! kill -0 $scheduler_pid; then
-            echo Scheduler start failure.
-            stop_ice 0
-            abort_tests
-        fi
-        for daemon in localice remoteice1 remoteice2; do
-            pid=${daemon}_pid
-            if ! kill -0 ${!pid}; then
-                echo Daemon $daemon start failure.
-                stop_ice 0
-                abort_tests
-            fi
-            if ! grep -q "Connected to scheduler" "$testdir"/${daemon}.log; then
-                # ensure log file flush
-                kill -HUP ${!pid}
-                grep -q "Connected to scheduler" "$testdir"/${daemon}.log || notready=1
-            fi
-        done
-        if test -z "$notready"; then
-            break;
-        fi
-        sleep 1
-    done
-    if test -n "$notready"; then
-        echo Icecream not ready, aborting.
-        stop_ice 0
-        abort_tests
-    fi
-    sleep 5 # Give the scheduler time to get everything set up
+    wait_for_ice_startup_complete scheduler localice remoteice1 remoteice2
     flush_logs
-    grep -q "Cannot use chroot, no remote jobs accepted." "$testdir"/remoteice1.log && chroot_disabled=1
-    grep -q "Cannot use chroot, no remote jobs accepted." "$testdir"/remoteice2.log && chroot_disabled=1
+    cat_log_last_mark remoteice1 | grep -q "Cannot use chroot, no remote jobs accepted." && chroot_disabled=1
+    cat_log_last_mark remoteice2 | grep -q "Cannot use chroot, no remote jobs accepted." && chroot_disabled=1
     if test -n "$chroot_disabled"; then
         skipped_tests="$skipped_tests CHROOT"
         echo Chroot not available, remote tests will be skipped.
@@ -201,25 +229,12 @@ start_ice()
 # start only local daemon, no scheduler
 start_only_daemon()
 {
-    ICECC_TEST_SOCKET="$testdir"/socket-localice $valgrind "${iceccd}" --no-remote -s localhost:8767 -b "$testdir"/envs-localice -l "$testdir"/localice.log -N localice -m 2 -v -v -v &
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_SCHEDULER=:8767 ICECC_TESTS=1 ICECC_TEST_SCHEDULER_PORTS=8767:8769 \
+        ICECC_TEST_FLUSH_LOG_MARK="$testdir"/flush_log_mark.txt ICECC_TEST_LOG_HEADER="$testdir"/log_header.txt \
+        $valgrind "${iceccd}" --no-remote -b "$testdir"/envs-localice -l "$testdir"/localice.log -n ${netname} -N localice -m 2 -v -v -v &
     localice_pid=$!
     echo $localice_pid > "$testdir"/localice.pid
-    if test -n "$valgrind"; then
-        sleep 10
-    else
-        sleep 1
-    fi
-    if ! kill -0 $localice_pid; then
-        echo Daemon localice start failure.
-        stop_only_daemon 0
-        abort_tests
-    fi
-    flush_logs
-    if ! grep -q "Netnames:" "$testdir"/localice.log; then
-        echo Daemon localice not ready, aborting.
-        stop_only_daemon 0
-        abort_tests
-    fi
+    wait_for_ice_startup_complete "noscheduler" localice
 }
 
 stop_ice()
@@ -229,16 +244,18 @@ stop_ice()
     # 2 - do not check, do not wait (wait would fail, started by previous shell)
     check_type="$1"
     if test $check_type -eq 2; then
-        scheduler_pid=`cat "$testdir"/scheduler.pid 2>/dev/null`
-        localice_pid=`cat "$testdir"/localice.pid 2>/dev/null`
-        remoteice1_pid=`cat "$testdir"/remoteice1.pid 2>/dev/null`
-        remoteice2_pid=`cat "$testdir"/remoteice2.pid 2>/dev/null`
+        scheduler_pid=$(cat "$testdir"/scheduler.pid 2>/dev/null)
+        localice_pid=$(cat "$testdir"/localice.pid 2>/dev/null)
+        remoteice1_pid=$(cat "$testdir"/remoteice1.pid 2>/dev/null)
+        remoteice2_pid=$(cat "$testdir"/remoteice2.pid 2>/dev/null)
     fi
     if test $check_type -eq 1; then
-        if ! kill -0 $scheduler_pid; then
-            echo Scheduler no longer running.
-            stop_ice 0
-            abort_tests
+        if test -n "$scheduler_pid"; then
+            if ! kill -0 $scheduler_pid; then
+                echo Scheduler no longer running.
+                stop_ice 0
+                abort_tests
+            fi
         fi
         for daemon in localice remoteice1 remoteice2; do
             pid=${daemon}_pid
@@ -266,6 +283,38 @@ stop_ice()
         scheduler_pid=
     fi
     rm -f "$testdir"/scheduler.pid
+    stop_secondary_scheduler $check_type
+}
+
+stop_secondary_scheduler()
+{
+    check_type="$1"
+    if test $check_type -eq 2; then
+        scheduler2_pid=$(cat "$testdir"/scheduler2.pid 2>/dev/null)
+    fi
+    if test $check_type -eq 1; then
+        if test -n "$scheduler2_pid"; then
+            if ! kill -0 $scheduler2_pid; then
+                echo Secondary scheduler no longer running.
+                stop_ice 0
+                abort_tests
+            fi
+        fi
+    fi
+    if test -n "$scheduler2_pid"; then
+        kill "$scheduler2_pid" 2>/dev/null
+        if test $check_type -eq 1; then
+            wait $scheduler2_pid
+            exitcode=$?
+            if test $exitcode -ne 0; then
+                echo Secondary scheduler exited with code $exitcode.
+                stop_ice 0
+                abort_tests
+            fi
+        fi
+        scheduler2_pid=
+    fi
+    rm -f "$testdir"/scheduler2.pid
 }
 
 stop_only_daemon()
@@ -285,12 +334,80 @@ stop_only_daemon()
     localice_pid=
 }
 
+wait_for_ice_startup_complete()
+{
+    noscheduler=
+    if test "$1" == "noscheduler"; then
+        noscheduler=1
+        shift
+    fi
+    processes="$@"
+    timeout=10
+    if test -n "$valgrind"; then
+        # need time to set up SIGHUP handler
+        sleep 5
+        timeout=15
+    fi
+    notready=
+    for ((i=0; i<timeout; i++)); do
+        notready=
+        for process in $processes; do
+            if echo "$process" | grep -q scheduler; then
+                local extra=
+                test "$process" != "scheduler" && extra="(${process}) "
+                pid=${process}_pid
+                if ! kill -0 ${!pid}; then
+                    echo Scheduler $extra start failure.
+                    stop_ice 0
+                    abort_tests
+                fi
+                cat_log_last_mark ${process} | grep -q "scheduler ready" || notready=1
+            elif echo "$process" | grep -q -e "localice" -e "remoteice"; then
+                pid=${process}_pid
+                if ! kill -0 ${!pid}; then
+                    echo Daemon $process start failure.
+                    stop_ice 0
+                    abort_tests
+                fi
+                if test -z "$noscheduler"; then
+                    cat_log_last_mark ${process} | grep -q "Connected to scheduler" || notready=1
+                else
+                    cat_log_last_mark ${process} | grep -q "Netnames:" || notready=1
+                fi
+            else
+                echo Internal test error, aborting.
+                stop_ice 0
+                abort_tests
+            fi
+        done
+        if test -z "$notready"; then
+            break;
+        fi
+        sleep 1
+        # ensure log file flush
+        for process in $processes; do
+            pid=${process}_pid
+            kill -HUP ${!pid}
+        done
+    done
+    if test -n "$notready"; then
+        echo Icecream not ready, aborting.
+        stop_ice 0
+        abort_tests
+    fi
+}
 
 # First argument is the expected output file, if any (otherwise specify "").
 # Second argument is "remote" (should be compiled on a remote host) or "local" (cannot be compiled remotely).
 # Third argument is expected exit code - if this is greater than 128 the exit code will be determined by invoking the compiler locally
-# Fourth argument is optional, "stderrfix" specifies that the command may result in local recompile because of the gcc
-# stderr workaround.
+# Follow optional arguments, in this order:
+#   - stderrfix - specifies that the command may result in local recompile because of the gcc stderr workaround.
+#   - keepoutput - will keep the file specified using $output (the remotely compiled version)
+#   - split_dwarf - compilation is done with -gsplit-dwarf
+#   - noresetlogs - will not use reset_logs at the start (needs to be done explicitly before calling run_ice)
+#   - remoteabort - remote compilation will abort (as a result of local processing failing and remote daemon killing the remote compiler)
+#   - nostderrcheck - will not compare stderr output
+#   - unusedmacrohack - hack for Wunused-macros test
 # Rest is the command to pass to icecc.
 # Command will be run both locally and using icecc and results compared.
 run_ice()
@@ -303,21 +420,54 @@ run_ice()
     shift
     stderrfix=
     if test "$1" = "stderrfix"; then
-        stderrfix=1
+        if test -n "$using_gcc"; then
+            stderrfix=1
+            shift
+        fi
+    fi
+    keepoutput=
+    if test "$1" = "keepoutput"; then
+        keepoutput=1
         shift
     fi
     split_dwarf=
     if test "$1" = "split_dwarf"; then
-        split_dwarf=$(echo $output | sed 's/\.[^.]*//g').dwo
+        if test -n "$output"; then
+            split_dwarf=$(echo $output | sed 's/\.[^.]*//g').dwo
+        fi
+        shift
+    fi
+    noresetlogs=
+    if test "$1" = "noresetlogs"; then
+        noresetlogs=1
+        shift
+    fi
+    remoteabort=
+    if test "$1" = "remoteabort"; then
+        remoteabort=1
+        shift
+    fi
+    nostderrcheck=
+    if test "$1" = "nostderrcheck"; then
+        nostderrcheck=1
+        shift
+    fi
+    unusedmacrohack=
+    if test "$1" = "unusedmacrohack"; then
+        unusedmacrohack=1
         shift
     fi
 
     if [[ $expected_exit -gt 128 ]]; then
-        $@
+        $@ 2>/dev/null
         expected_exit=$?
     fi
 
-    reset_logs local "$@"
+    if test -z "$noresetlogs"; then
+        reset_logs local "$@"
+    else
+        mark_logs local "$@"
+    fi
     echo Running: "$@"
     ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=localice ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" "$@" 2>"$testdir"/stderr.localice
 
@@ -328,7 +478,7 @@ run_ice()
     if test -n "$split_dwarf"; then
         mv "$split_dwarf" "$split_dwarf".localice
     fi
-    cat "$testdir"/stderr.localice >> "$testdir"/stderr.log
+    cat "$testdir"/stderr.localice >> "$testdir"/stderr.localice.log
     flush_logs
     check_logs_for_generic_errors
     if test "$remote_type" = "remote"; then
@@ -345,7 +495,7 @@ run_ice()
     fi
 
     if test -z "$chroot_disabled"; then
-        reset_logs remote "$@"
+        mark_logs remote "$@"
         ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" "$@" 2>"$testdir"/stderr.remoteice
         remoteice_exit=$?
         if test -n "$output"; then
@@ -354,12 +504,25 @@ run_ice()
         if test -n "$split_dwarf"; then
             mv "$split_dwarf" "$split_dwarf".remoteice
         fi
-        cat "$testdir"/stderr.remoteice >> "$testdir"/stderr.log
+        cat "$testdir"/stderr.remoteice >> "$testdir"/stderr.remoteice.log
         flush_logs
         check_logs_for_generic_errors
         if test "$remote_type" = "remote"; then
             check_log_message icecc "Have to use host 127.0.0.1:10246"
             check_log_error icecc "<building_local>"
+            if test -n "$output"; then
+                check_log_message remoteice1 "Remote compilation completed with exit code 0"
+                check_log_error remoteice1 "Remote compilation aborted with exit code"
+                check_log_error remoteice1 "Remote compilation exited with exit code"
+            elif test -n "$remoteabort"; then
+                check_log_message remoteice1 "Remote compilation aborted with exit code"
+                check_log_error remoteice1 "Remote compilation completed with exit code 0"
+                check_log_error remoteice1 "Remote compilation exited with exit code"
+            else
+                check_log_message remoteice1 "Remote compilation exited with exit code $expected_exit"
+                check_log_error remoteice1 "Remote compilation completed with exit code 0"
+                check_log_error remoteice1 "Remote compilation aborted with exit code"
+            fi
         else
             check_log_message icecc "<building_local>"
             check_log_error icecc "Have to use host 127.0.0.1:10246"
@@ -368,10 +531,12 @@ run_ice()
         check_log_error icecc "building myself, but telling localhost"
         if test -z "$stderrfix"; then
             check_log_error icecc "local build forced"
+        else
+            check_log_message icecc "local build forced by remote exception: Error 102 - command needs stdout/stderr workaround, recompiling locally"
         fi
     fi
 
-    reset_logs noice "$@"
+    mark_logs noice "$@"
     "$@" 2>"$testdir"/stderr
     normal_exit=$?
     cat "$testdir"/stderr >> "$testdir"/stderr.log
@@ -398,16 +563,38 @@ run_ice()
         stop_ice 0
         abort_tests
     fi
-    if ! diff -q "$testdir"/stderr.localice "$testdir"/stderr; then
-        echo "Stderr mismatch ($"testdir"/stderr.localice)"
-        stop_ice 0
-        abort_tests
-    fi
-    if test -z "$chroot_disabled"; then
-        if ! diff -q "$testdir"/stderr.remoteice "$testdir"/stderr; then
-            echo "Stderr mismatch ($"testdir"/stderr.remoteice)"
+    if test -z "$nostderrcheck"; then
+        if ! diff "$testdir"/stderr.localice "$testdir"/stderr >/dev/null; then
+            echo "Stderr mismatch ($testdir/stderr.localice)"
+            echo ================
+            diff -u "$testdir"/stderr "$testdir"/stderr.localice
+            echo ================
             stop_ice 0
             abort_tests
+        fi
+        if test -z "$chroot_disabled"; then
+            skipstderrcheck=
+            if test -n "$unusedmacrohack" -a -n "$using_gcc"; then
+                # gcc -Wunused-macro gives different location for the error depending on whether -E is used or not
+                if ! diff "$testdir"/stderr.remoteice "$testdir"/stderr >/dev/null; then
+                    if diff "$testdir"/stderr.remoteice unusedmacro1.txt >/dev/null; then
+                        skipstderrcheck=1
+                    fi
+                    if diff "$testdir"/stderr.remoteice unusedmacro2.txt >/dev/null; then
+                        skipstderrcheck=1
+                    fi
+                fi
+            fi
+            if test -z "$skipstderrcheck"; then
+                if ! diff "$testdir"/stderr.remoteice "$testdir"/stderr >/dev/null; then
+                    echo "Stderr mismatch ($testdir/stderr.remoteice)"
+                    echo ================
+                    diff -u "$testdir"/stderr "$testdir"/stderr.remoteice
+                    echo ================
+                    stop_ice 0
+                    abort_tests
+                fi
+            fi
         fi
     fi
 
@@ -416,48 +603,127 @@ run_ice()
     local remove_debug_pubnames="/^\s*Offset\s*Name/,/^\s*$/s/\s*[A-Fa-f0-9]*\s*//"
     local remove_size_of_area="s/\(Size of area in.*section:\)\s*[0-9]*/\1/g"
     if test -n "$output"; then
-        readelf -wlLiaprmfFoRt "$output" | sed -e "$remove_debug_info" \
-            -e "$remove_offset_number" \
-            -e "$remove_debug_pubnames" \
-            -e "$remove_size_of_area" > "$output".readelf.txt || cp "$output" "$output".readelf.txt
-        readelf -wlLiaprmfFoRt "$output".localice | sed -e "$remove_debug_info" \
-            -e "$remove_offset_number" \
-            -e "$remove_debug_pubnames" \
-            -e "$remove_size_of_area" > "$output".local.readelf.txt || cp "$output" "$output".local.readelf.txt
-        if ! diff -q "$output".local.readelf.txt "$output".readelf.txt; then
-            echo "Output mismatch ($output.localice)"
-            stop_ice 0
-            abort_tests
-        fi
-        if test -z "$chroot_disabled"; then
-            readelf -wlLiaprmfFoRt "$output".remoteice | sed -e "$remove_debug_info" \
+        if file "$output" | grep ELF >/dev/null; then
+            readelf -wlLiaprmfFoRt "$output" | sed -e "$remove_debug_info" \
                 -e "$remove_offset_number" \
                 -e "$remove_debug_pubnames" \
-                -e "$remove_size_of_area" > "$output".remote.readelf.txt || cp "$output" "$output".remote.readelf.txt
-            if ! diff -q "$output".remote.readelf.txt "$output".readelf.txt; then
-                echo "Output mismatch ($output.remoteice)"
+                -e "$remove_size_of_area" > "$output".readelf.txt || cp "$output" "$output".readelf.txt
+            readelf -wlLiaprmfFoRt "$output".localice | sed -e "$remove_debug_info" \
+                -e "$remove_offset_number" \
+                -e "$remove_debug_pubnames" \
+                -e "$remove_size_of_area" > "$output".local.readelf.txt || cp "$output" "$output".local.readelf.txt
+            if ! diff "$output".local.readelf.txt "$output".readelf.txt >/dev/null; then
+                echo "Output mismatch ($output.localice)"
+                echo ================
+                diff -u "$output".readelf.txt "$output".local.readelf.txt
+                echo ================
                 stop_ice 0
                 abort_tests
+            fi
+            if test -z "$chroot_disabled"; then
+                readelf -wlLiaprmfFoRt "$output".remoteice | sed -e "$remove_debug_info" \
+                    -e "$remove_offset_number" \
+                    -e "$remove_debug_pubnames" \
+                    -e "$remove_size_of_area" > "$output".remote.readelf.txt || cp "$output" "$output".remote.readelf.txt
+                if ! diff "$output".remote.readelf.txt "$output".readelf.txt >/dev/null; then
+                    echo "Output mismatch ($output.remoteice)"
+                    echo ================
+                    diff -u "$output".readelf.txt "$output".remote.readelf.txt
+                    echo ================
+                    stop_ice 0
+                    abort_tests
+                fi
+            fi
+        elif echo "$output" | grep -q '\.gch$'; then
+            # PCH file, no idea how to check they are the same if they are not 100% identical
+            # Make silent.
+            true
+        elif file "$output" | grep Mach >/dev/null; then
+            # No idea how to check they are the same if they are not 100% identical
+            if ! diff "$output".localice "$output" >/dev/null; then
+                echo "Output mismatch ($output.localice), Mach object files, not knowing how to verify"
+            fi
+            if test -z "$chroot_disabled"; then
+                if ! diff "$output".remoteice "$output" >/dev/null; then
+                    echo "Output mismatch ($output.remoteice), Mach object files, not knowing how to verify"
+                fi
+            fi
+        elif echo "$output" | grep -q -e '\.o$' -e '\.dwo$'; then
+            # possibly cygwin .o file, no idea how to check they are the same if they are not 100% identical
+            if ! diff "$output".localice "$output" >/dev/null; then
+                echo "Output mismatch ($output.localice), assuming Cygwin object files, not knowing how to verify"
+            fi
+            if test -z "$chroot_disabled"; then
+                if ! diff "$output".remoteice "$output" >/dev/null; then
+                    echo "Output mismatch ($output.remoteice), assuming Cygwin object files, not knowing how to verify"
+                fi
+            fi
+        else
+            if ! diff "$output".localice "$output" >/dev/null; then
+                echo "Output mismatch ($output.localice)"
+                echo ================
+                diff -u "$output" "$output".localice
+                echo ================
+                stop_ice 0
+                abort_tests
+            fi
+            if test -z "$chroot_disabled"; then
+                if ! diff "$output".remoteice "$output" >/dev/null; then
+                    echo "Output mismatch ($output.remoteice)"
+                    echo ================
+                    diff -u "$output" "$output".remoteice
+                    echo ================
+                    stop_ice 0
+                    abort_tests
+                fi
             fi
         fi
     fi
     if test -n "$split_dwarf"; then
-        readelf -wlLiaprmfFoRt "$split_dwarf" | \
-            sed -e "$remove_debug_info" -e "$remove_offset_number" > "$split_dwarf".readelf.txt || cp "$split_dwarf" "$split_dwarf".readelf.txt
-        readelf -wlLiaprmfFoRt "$split_dwarf".localice | \
-            sed -e $remove_debug_info -e "$remove_offset_number" > "$split_dwarf".local.readelf.txt || cp "$split_dwarf" "$split_dwarf".local.readelf.txt
-        if ! diff -q "$split_dwarf".local.readelf.txt "$split_dwarf".readelf.txt; then
-            echo "Output DWO mismatch ($split_dwarf.localice)"
-            stop_ice 0
-            abort_tests
-        fi
-        if test -z "$chroot_disabled"; then
-            readelf -wlLiaprmfFoRt "$split_dwarf".remoteice | \
-                sed -e "$remove_debug_info" -e "$remove_offset_number" > "$split_dwarf".remote.readelf.txt || cp "$split_dwarf" "$split_dwarf".remote.readelf.txt
-            if ! diff -q "$split_dwarf".remote.readelf.txt "$split_dwarf".readelf.txt; then
-                echo "Output DWO mismatch ($split_dwarf.remoteice)"
+        if file "$output" | grep ELF >/dev/null; then
+            readelf -wlLiaprmfFoRt "$split_dwarf" | \
+                sed -e "$remove_debug_info" -e "$remove_offset_number" > "$split_dwarf".readelf.txt || cp "$split_dwarf" "$split_dwarf".readelf.txt
+            readelf -wlLiaprmfFoRt "$split_dwarf".localice | \
+                sed -e $remove_debug_info -e "$remove_offset_number" > "$split_dwarf".local.readelf.txt || cp "$split_dwarf" "$split_dwarf".local.readelf.txt
+            if ! diff "$split_dwarf".local.readelf.txt "$split_dwarf".readelf.txt >/dev/null; then
+                echo "Output DWO mismatch ($split_dwarf.localice)"
+                echo ====================
+                diff -u "$split_dwarf".readelf.txt "$split_dwarf".local.readelf.txt
+                echo ====================
                 stop_ice 0
                 abort_tests
+            fi
+            if test -z "$chroot_disabled"; then
+                readelf -wlLiaprmfFoRt "$split_dwarf".remoteice | \
+                    sed -e "$remove_debug_info" -e "$remove_offset_number" > "$split_dwarf".remote.readelf.txt || cp "$split_dwarf" "$split_dwarf".remote.readelf.txt
+                if ! diff "$split_dwarf".remote.readelf.txt "$split_dwarf".readelf.txt >/dev/null; then
+                    echo "Output DWO mismatch ($split_dwarf.remoteice)"
+                    echo ====================
+                    diff -u "$split_dwarf".readelf.txt "$split_dwarf".remote.readelf.txt
+                    echo ====================
+                    stop_ice 0
+                    abort_tests
+                fi
+            fi
+        elif file "$output" | grep Mach >/dev/null; then
+            # No idea how to check they are the same if they are not 100% identical
+            if ! diff "$split_dwarf".localice "$split_dwarf" >/dev/null; then
+                echo "Output mismatch ($split_dwarf.localice), Mach object files, not knowing how to verify"
+            fi
+            if test -z "$chroot_disabled"; then
+                if ! diff "$split_dwarf".remoteice "$split_dwarf" >/dev/null; then
+                    echo "Output mismatch ($split_dwarf.remoteice), Mach object files, not knowing how to verify"
+                fi
+            fi
+        else
+            # possibly cygwin .o file, no idea how to check they are the same if they are not 100% identical
+            if ! diff "$split_dwarf".localice "$split_dwarf" >/dev/null; then
+                echo "Output mismatch ($split_dwarf.localice), assuming Cygwin object files, not knowing how to verify"
+            fi
+            if test -z "$chroot_disabled"; then
+                if ! diff "$split_dwarf".remoteice "$split_dwarf" >/dev/null; then
+                    echo "Output mismatch ($split_dwarf.remoteice), assuming Cygwin object files, not knowing how to verify"
+                fi
             fi
         fi
     fi
@@ -469,7 +735,16 @@ run_ice()
         echo
     fi
     if test -n "$output"; then
-        rm -f "$output" "$output".localice "$output".remoteice "$output".readelf.txt "$output".local.readelf.txt "$output".remote.readelf.txt
+        if test -n "$keepoutput"; then
+            if test -z "$chroot_disabled"; then
+                mv "$output".remoteice "$output"
+            else
+                mv "$output".localice "$output"
+            fi
+        else
+            rm -f "output"
+        fi
+        rm -f "$output".localice "$output".remoteice "$output".readelf.txt "$output".local.readelf.txt "$output".remote.readelf.txt
     fi
     if test -n "$split_dwarf"; then
         rm -f "$split_dwarf" "$split_dwarf".localice "$split_dwarf".remoteice "$split_dwarf".readelf.txt "$split_dwarf".local.readelf.txt "$split_dwarf".remote.readelf.txt
@@ -482,18 +757,13 @@ make_test()
     # make test - actually try something somewhat realistic. Since each node is set up to serve
     # only 2 jobs max, at least some of the 10 jobs should be built remotely.
 
-    # All the test compiles are small, and should produce small .o files, which will make the scheduler
-    # stats for those jobs, so it will not actually have any statistics about nodes (make_test is intentionally
-    # run early to ensure this). So run the test once, first time without stats, second time with stats
-    # (make.h has large data to ensure the first make_test run will finally produce statistics).
-    run_number=$1
-
-    echo Running make test $run_number.
-    reset_logs remote "make test $run_number"
+    echo Running make test.
+    reset_logs "" "make test"
     make -f Makefile.test OUTDIR="$testdir" clean -s
-    PATH="$prefix"/libexec/icecc/bin:/usr/local/bin:/usr/bin:/bin ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log make -f Makefile.test OUTDIR="$testdir" -j10 -s 2>>"$testdir"/stderr.log
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log \
+        make -f Makefile.test OUTDIR="$testdir" CXX="${icecc} $TESTCXX" -j10 -s 2>>"$testdir"/stderr.log
     if test $? -ne 0 -o ! -x "$testdir"/maketest; then
-        echo Make test $run_number failed.
+        echo Make test failed.
         stop_ice 0
         abort_tests
     fi
@@ -502,57 +772,66 @@ make_test()
     check_log_message icecc "Have to use host 127.0.0.1:10246"
     check_log_message icecc "Have to use host 127.0.0.1:10247"
     check_log_message_count icecc 1 "<building_local>"
-    if test $run_number -eq 1; then
-        check_log_message scheduler "no job stats - returning randomly selected"
-    else
-        check_log_error scheduler "no job stats - returning randomly selected"
-    fi
-    echo Make test $run_number successful.
+    check_log_message remoteice1 "Remote compilation completed with exit code 0"
+    check_log_error remoteice1 "Remote compilation aborted with exit code"
+    check_log_error remoteice1 "Remote compilation exited with exit code $expected_exit"
+    check_log_message remoteice2 "Remote compilation completed with exit code 0"
+    check_log_error remoteice2 "Remote compilation aborted with exit code"
+    check_log_error remoteice2 "Remote compilation exited with exit code $expected_exit"
+    echo Make test successful.
     echo
     make -f Makefile.test OUTDIR="$testdir" clean -s
 }
 
 # 1st argument, if set, means we run without scheduler
-icerun_test()
+icerun_serialize_test()
 {
     # test that icerun really serializes jobs and only up to 2 (max jobs of the local daemon) are run at any time
     noscheduler=
     test -n "$1" && noscheduler=" (no scheduler)"
     echo "Running icerun${noscheduler} test."
-    reset_logs local "icerun${noscheduler} test"
+    reset_logs "" "icerun${noscheduler} test"
     # remove . from PATH if set
     save_path=$PATH
-    export PATH=`echo $PATH | sed 's/:.:/:/' | sed 's/^.://' | sed 's/:.$//'`
+    export PATH=$(echo $PATH | sed 's/:.:/:/' | sed 's/^.://' | sed 's/:.$//')
     rm -rf "$testdir"/icerun
     mkdir -p "$testdir"/icerun
-    for i in `seq 1 10`; do
+    if test -n "$valgrind"; then
+        export ICERUN_TEST_VALGRIND=1
+    fi
+    for i in $(seq 1 10); do
         path=$PATH
         if test $i -eq 1; then
             # check icerun with absolute path
-            testbin=`pwd`/icerun-test.sh
+            testbin=$(pwd)/icerun-test.sh
         elif test $i -eq 2; then
             # check with relative path
             testbin=../tests/icerun-test.sh
         elif test $i -eq 3; then
             # test with PATH
             testbin=icerun-test.sh
-            path=`pwd`:$PATH
+            path=$(pwd):$PATH
         else
             testbin=./icerun-test.sh
         fi
-        PATH=$path ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "$prefix"/bin/icerun $testbin "$testdir"/icerun $i &
+        PATH=$path ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log \
+            $valgrind "${icerun}" $testbin "$testdir"/icerun $i &
     done
+    unset ICERUN_TEST_VALGRIND
     timeout=100
+    if test -n "$valgrind"; then
+        timeout=500
+    fi
     seen2=
     while true; do
-        runcount=`ls -1 "$testdir"/icerun/running* 2>/dev/null | wc -l`
+        runcount=$(ls -1 "$testdir"/icerun/running* 2>/dev/null | wc -l)
         if test $runcount -gt 2; then
             echo "Icerun${noscheduler} test failed, more than expected 2 processes running."
             stop_ice 0
             abort_tests
         fi
         test $runcount -eq 2 && seen2=1
-        donecount=`ls -1 "$testdir"/icerun/done* 2>/dev/null | wc -l`
+        donecount=$(ls -1 "$testdir"/icerun/done* 2>/dev/null | wc -l)
         if test $donecount -eq 10; then
             break
         fi
@@ -571,60 +850,160 @@ icerun_test()
         abort_tests
     fi
 
-    # check that plain 'icerun-test.sh' doesn't work for the current directory (i.e. ./ must be required just like with normal execution)
-    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "$prefix"/bin/icerun icerun-test.sh "$testdir"/icerun 0 &
-    icerun_test_pid=$!
-    timeout=20
-    while true; do
-        if ! kill -0 $icerun_test_pid 2>/dev/null; then
-            break
-        fi
-        sleep 0.1
-        timeout=$((timeout-1))
-        if test $timeout -eq 0; then
-            echo "Icerun${noscheduler} test timed out."
-            stop_ice 0
-            abort_tests
-        fi
-    done
-    
     flush_logs
     check_logs_for_generic_errors
+    check_log_message_count icecc 10 "<building_local>"
     check_log_error icecc "Have to use host 127.0.0.1:10246"
     check_log_error icecc "Have to use host 127.0.0.1:10247"
     check_log_error icecc "building myself, but telling localhost"
     check_log_error icecc "local build forced"
-    check_log_message_count icecc 11 "<building_local>"
-    check_log_message_count icecc 1 "couldn't find any"
-    check_log_message_count icecc 1 "could not find icerun-test.sh in PATH."
     echo "Icerun${noscheduler} test successful."
     echo
     rm -r "$testdir"/icerun
     export PATH=$save_path
 }
 
+icerun_nopath_test()
+{
+    reset_logs "" "icerun nopath test"
+    echo "Running icerun nopath test."
+    # check that plain 'icerun-test.sh' doesn't work for the current directory (i.e. ./ must be required just like with normal execution)
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log \
+        $valgrind "${icerun}" icerun-test.sh
+    check_log_error icecc "invoking:"
+    check_log_message icecc "couldn't find any"
+    check_log_message icecc "could not find icerun-test.sh in PATH."
+    echo "Icerun nopath test successful."
+    echo
+}
+
+icerun_nocompile_test()
+{
+    # check that 'icerun gcc' still only runs the command without trying a remote compile
+    reset_logs "" "icerun${noscheduler} nocompile test"
+    echo "Running icerun nocompile test."
+    rm -rf -- "$testdir"/fakegcc
+    mkdir -p "$testdir"/fakegcc
+    echo '#! /bin/sh' > "$testdir"/fakegcc/gcc
+    echo 'echo "$@" >' "$testdir"/fakegcc/output >> "$testdir"/fakegcc/gcc
+    echo 'exit 44' >> "$testdir"/fakegcc/gcc
+    chmod +x "$testdir"/fakegcc/gcc
+    args="-Wall a.c b.c -c -s"
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log \
+        PATH="$testdir"/fakegcc:$PATH $valgrind "${icerun}" gcc $args
+    if test $? -ne 44; then
+        echo Error, icerun gcc failed.
+        stop_ice 0
+        abort_tests
+    fi
+    check_log_message icecc "invoking: $testdir/fakegcc/gcc $args\$"
+    rm -rf -- "$testdir"/fakegcc
+    echo "Icerun nocompile test successful."
+    echo
+}
+
 # Check that icecc --build-native works.
 buildnativetest()
 {
     echo Running icecc --build-native test.
-    local tgz=$(PATH="$prefix"/bin:/bin:/usr/bin icecc --build-native 2>&1 | \
-        grep "^creating .*\.tar\.gz$" | sed -e "s/^creating //")
+    reset_logs "local" "Build native"
+    test_build_native_helper $TESTCC 1
     if test $? -ne 0; then
-        echo icecc --build-native test failed.
+        echo Icecc --build-native test failed.
+        cat "$testdir"/icecc-build-native-output
+        stop_ice 0
         abort_tests
     fi
-    rm -f $tgz
-    echo icecc --build-native test successful.
+    echo Icecc --build-native test successful.
     echo
+}
+
+buildnativewithsymlinktest()
+{
+    reset_logs local "Native environment with symlink"
+    echo Testing native environment with a compiler symlink.
+    rm -rf -- "$testdir"/wrappers
+    mkdir -p "$testdir"/wrappers
+    ln -s $(command -v $TESTCC) "$testdir"/wrappers/
+    ln -s $(command -v $TESTCXX) "$testdir"/wrappers/
+    test_build_native_helper "$testdir"/wrappers/$(basename $TESTCC) 0
+    if test $? -ne 0; then
+        echo Testing native environment with a compiler symlink failed.
+        cat "$testdir"/icecc-build-native-output
+        stop_ice 0
+        abort_tests
+    fi
+    rm -rf -- "$testdir"/wrappers
+    echo Testing native environment with a compiler symlink successful.
+    echo
+}
+
+buildnativewithwrappertest()
+{
+    reset_logs local "Native environment with a compiler wrapper"
+    echo Testing native environment with a compiler wrapper.
+    rm -rf -- "$testdir"/wrappers
+    mkdir -p "$testdir"/wrappers
+    echo '#! /bin/sh' > "$testdir"/wrappers/$(basename $TESTCC)
+    echo exec $TESTCC '"$@"' >> "$testdir"/wrappers/$(basename $TESTCC)
+    echo '#! /bin/sh' > "$testdir"/wrappers/$(basename $TESTCXX)
+    echo exec $TESTCXX '"$@"' >> "$testdir"/wrappers/$(basename $TESTCXX)
+    chmod +x "$testdir"/wrappers/$(basename $TESTCC) "$testdir"/wrappers/$(basename $TESTCXX)
+    test_build_native_helper "$testdir"/wrappers/$(basename $TESTCC) 0
+    if test $? -ne 0; then
+        echo Testing native environment with a compiler symlink failed.
+        cat "$testdir"/icecc-build-native-output
+        stop_ice 0
+        abort_tests
+    fi
+    rm -rf -- "$testdir"/wrappers
+    echo Testing native environment with a compiler symlink successful.
+    echo
+}
+
+test_build_native_helper()
+{
+    compiler=$1
+    add_skip=$2
+    pushd "$testdir" >/dev/null
+    ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log ${icecc} --build-native $compiler > "$testdir"/icecc-build-native-output
+    if test $? -ne 0; then
+        return 1
+    fi
+    local tgz=$(grep "^creating .*\.tar\.gz$" "$testdir"/icecc-build-native-output | sed -e "s/^creating //")
+    if test -z "$tgz"; then
+        return 2
+    fi
+    sudo -n -- ${icecc_test_env} -q "$tgz"
+    retcode=$?
+    if test $retcode -eq 1; then
+        echo Cannot verify environment, use sudo, skipping test.
+        if test "$add_skip" = "1"; then
+            skipped_tests="$skipped_tests $testtype"
+        fi
+    elif test $retcode -ne 0; then
+        echo icecc_test_env failed to validate the environment
+        return 3
+    fi
+    rm -f $tgz "$testdir"/icecc-build-native-output
+    popd >/dev/null
+    return 0
 }
 
 # Check that icecc recursively invoking itself is detected.
 recursive_test()
 {
     echo Running recursive check test.
-    reset_logs local "recursive check"
+    reset_logs "" "recursive check"
 
-    PATH="$prefix"/lib/icecc/bin:"$prefix"/bin:/usr/local/bin:/usr/bin:/bin ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log "${icecc}" ./recursive_g++ -Wall -c plain.c -o plain.o 2>>"$testdir"/stderr.log
+    recursive_tester=
+    if test -n "$using_clang"; then
+        recursive_tester=./recursive_clang++
+    elif test -n "$using_gcc"; then
+        recursive_tester=./recursive_g++
+    fi
+    PATH="$prefix"/lib/icecc/bin:"$prefix"/bin:/usr/local/bin:/usr/bin:/bin ICECC_TEST_SOCKET="$testdir"/socket-localice \
+        ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log "${icecc}" ./${recursive_tester} -Wall -c plain.c -o plain.o 2>>"$testdir"/stderr.log
     if test $? -ne 111; then
         echo Recursive check test failed.
         stop_ice 0
@@ -641,31 +1020,45 @@ recursive_test()
 clangplugintest()
 {
     echo Running Clang plugin test.
-    reset_logs remote "clang plugin"
+    reset_logs "" "clang plugin"
+
+    if test -z "$LLVM_CONFIG"; then
+        LLVM_CONFIG=llvm-config
+    fi
+    clangcxxflags=$($LLVM_CONFIG --cxxflags 2>>"$testdir"/stderr.log)
+    if test $? -ne 0; then
+        echo Cannot find Clang development headers, clang plugin test skipped.
+        echo
+        skipped_tests="$skipped_tests clangplugin"
+        return
+    fi
+    echo Clang plugin compile flags: $clangcxxflags
+    $TESTCXX -shared -fPIC -g -o "$testdir"/clangplugin.so clangplugin.cpp $clangcxxflags 2>>"$testdir"/stderr.log
+    if test $? -ne 0; then
+        echo Failed to compile clang plugin, clang plugin test skipped.
+        echo
+        skipped_tests="$skipped_tests clangplugin"
+    fi
 
     # TODO This should be able to also handle the clangpluginextra.txt argument without the absolute path.
-    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log ICECC_EXTRAFILES=clangpluginextra.txt $valgrind "${icecc}" \
-        $CLANGXX -Wall -c -Xclang -load -Xclang "$builddir"/clangplugin.so -Xclang -add-plugin -Xclang icecreamtest -Xclang -plugin-arg-icecreamtest -Xclang `realpath -s clangpluginextra.txt` clangplugintest.cpp -o "$testdir"/clangplugintest.o 2>>"$testdir"/stderr.log
-    if test $? -ne 0; then
-        echo Clang plugin test failed.
-        stop_ice 0
-        abort_tests
+    export ICECC_EXTRAFILES=clangpluginextra.txt
+    run_ice "$testdir/clangplugintest.o" "remote" 0 $TESTCXX -Wall -c -Xclang -load -Xclang "$testdir"/clangplugin.so \
+        -Xclang -add-plugin -Xclang icecreamtest -Xclang -plugin-arg-icecreamtest -Xclang $(realpath -s clangpluginextra.txt) \
+        clangplugintest.cpp -o "$testdir"/clangplugintest.o
+    unset ICECC_EXTRAFILES
+    also_remote=
+    if test -z "$chroot_disabled"; then
+        also_remote=".remoteice"
     fi
-    flush_logs
-    check_logs_for_generic_errors
-    check_log_message icecc "Have to use host 127.0.0.1:10246"
-    check_log_error icecc "Have to use host 127.0.0.1:10247"
-    check_log_error icecc "building myself, but telling localhost"
-    check_log_error icecc "local build forced"
-    check_log_error icecc "<building_local>"
-    check_log_message_count stderr 1 "clangplugintest.cpp:3:5: warning: Icecream plugin found return false"
-    check_log_message_count stderr 1 "warning: Extra file check successful"
-    check_log_error stderr "Extra file open error"
-    check_log_error stderr "Incorrect number of arguments"
-    check_log_error stderr "File contents do not match"
+    for type in "" ".localice" $also_remote; do
+        check_section_log_message_count stderr${type} 1 "clangplugintest.cpp:3:5: warning: Icecream plugin found return false"
+        check_section_log_message_count stderr${type} 1 "warning: Extra file check successful"
+        check_section_log_error stderr${type} "Extra file open error"
+        check_section_log_error stderr${type} "Incorrect number of arguments"
+        check_section_log_error stderr${type} "File contents do not match"
+    done
     echo Clang plugin test successful.
     echo
-    rm "$testdir"/clangplugintest.o
 }
 
 # Both clang and gcc4.8+ produce different debuginfo depending on whether the source file is
@@ -675,22 +1068,18 @@ clangplugintest()
 # 2nd argument is first line of debug at which to start comparing.
 debug_test()
 {
-    # debug tests fail when the daemon is not running in the install directory
-    # Sanitizers will not give good output on error as a result
-    kill_daemon localice
-    ICECC_TEST_SOCKET="$testdir"/socket-localice $valgrind "${prefix}/sbin/iceccd" -s localhost:8767 -b "$testdir"/envs-localice -l "$testdir"/localice.log -N localice  -v -v -v --no-remote -m 2 &
-    localice_pid=$!
-    echo ${localice_pid} > "$testdir"/${localice}.pid
-    wait_for_proc_sleep 10 $localice_pid
-
     compiler="$1"
     args="$2"
     cmd="$1 $2"
     debugstart="$3"
     echo "Running debug test ($cmd)."
-    reset_logs remote "debug test ($cmd)"
+    reset_logs "" "debug test ($cmd)"
 
-    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" \
+    preferred=remoteice1
+    if test -n "$chroot_disabled"; then
+        preferred=localice
+    fi
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=$preferred ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" \
         $cmd -o "$testdir"/debug-remote.o 2>>"$testdir"/stderr.log
     if test $? -ne 0; then
         echo Debug test compile failed.
@@ -700,11 +1089,22 @@ debug_test()
 
     flush_logs
     check_logs_for_generic_errors
-    check_log_message icecc "Have to use host 127.0.0.1:10246"
-    check_log_error icecc "Have to use host 127.0.0.1:10247"
-    check_log_error icecc "building myself, but telling localhost"
-    check_log_error icecc "local build forced"
-    check_log_error icecc "<building_local>"
+    if test -z "$chroot_disabled"; then
+        check_log_message icecc "Have to use host 127.0.0.1:10246"
+        check_log_error icecc "Have to use host 127.0.0.1:10247"
+        check_log_error icecc "building myself, but telling localhost"
+        check_log_error icecc "local build forced"
+        check_log_error icecc "<building_local>"
+        check_log_message remoteice1 "Remote compilation completed with exit code 0"
+        check_log_error remoteice1 "Remote compilation aborted with exit code"
+        check_log_error remoteice1 "Remote compilation exited with exit code"
+    else
+        check_log_message icecc "building myself, but telling localhost"
+        check_log_error icecc "Have to use host 127.0.0.1:10246"
+        check_log_error icecc "Have to use host 127.0.0.1:10247"
+        check_log_error icecc "local build forced"
+        check_log_error icecc "<building_local>"
+    fi
     $compiler -o "$testdir"/debug-remote "$testdir"/debug-remote.o
     if test $? -ne 0; then
         echo Linking in debug test failed.
@@ -717,19 +1117,6 @@ debug_test()
         stop_ice 0
         abort_tests
     fi
-
-    # gcc-4.8+ has -grecord-gcc-switches, which makes the .o differ because of the extra flags the daemon adds,
-    # this changes DW_AT_producer and also offsets
-    local remove_debug_info="s/\(Length\|DW_AT_\(GNU_dwo_\(id\|name\)\|comp_dir\|producer\|linkage_name\|name\)\).*/\1/g"
-    local remove_offset_number="s/<[A-Fa-f0-9]*>/<>/g"
-    local remove_size_of_area="s/\(Size of area in.*section:\)\s*[0-9]*/\1/g"
-    local remove_debug_pubnames="/^\s*Offset\s*Name/,/^\s*$/s/\s*[A-Fa-f0-9]*\s*//"
-    readelf -wlLiaprmfFoRt "$testdir"/debug-remote.o | sed -e 's/offset: 0x[0-9a-fA-F]*//g' \
-        -e 's/[ ]*--param ggc-min-expand.*heapsize\=[0-9]\+//g' \
-        -e "$remove_debug_info" \
-        -e "$remove_offset_number" \
-        -e "$remove_size_of_area" \
-        -e "$remove_debug_pubnames" > "$testdir"/readelf-remote.txt
 
     $cmd -o "$testdir"/debug-local.o 2>>"$testdir"/stderr.log
     if test $? -ne 0; then
@@ -749,67 +1136,85 @@ debug_test()
         stop_ice 0
         abort_tests
     fi
-    readelf -wlLiaprmfFoRt "$testdir"/debug-local.o | sed -e 's/offset: 0x[0-9a-fA-F]*//g' \
-        -e "$remove_debug_info" \
-        -e "$remove_offset_number" \
-        -e "$remove_size_of_area" \
-        -e "$remove_debug_pubnames" > "$testdir"/readelf-local.txt
-
-    if ! diff -q "$testdir"/debug-output-local.txt "$testdir"/debug-output-remote.txt ; then
+    if ! diff "$testdir"/debug-output-local.txt "$testdir"/debug-output-remote.txt >/dev/null; then
         echo Gdb output different.
+        echo =====================
+        diff -u "$testdir"/debug-output-local.txt "$testdir"/debug-output-remote.txt
+        echo =====================
         stop_ice 0
         abort_tests
     fi
-    if ! diff -q "$testdir"/readelf-local.txt "$testdir"/readelf-remote.txt ; then
-        echo Readelf output different.
-        stop_ice 0
-        abort_tests
+
+    # gcc-4.8+ has -grecord-gcc-switches, which makes the .o differ because of the extra flags the daemon adds,
+    # this changes DW_AT_producer and also offsets
+    local remove_debug_info="s/\(Length\|DW_AT_\(GNU_dwo_\(id\|name\)\|comp_dir\|producer\|linkage_name\|name\)\).*/\1/g"
+    local remove_offset_number="s/<[A-Fa-f0-9]*>/<>/g"
+    local remove_size_of_area="s/\(Size of area in.*section:\)\s*[0-9]*/\1/g"
+    local remove_debug_pubnames="/^\s*Offset\s*Name/,/^\s*$/s/\s*[A-Fa-f0-9]*\s*//"
+    if file "$testdir"/debug-remote.o | grep ELF >/dev/null; then
+        readelf -wlLiaprmfFoRt "$testdir"/debug-remote.o | sed -e 's/offset: 0x[0-9a-fA-F]*//g' \
+            -e 's/[ ]*--param ggc-min-expand.*heapsize\=[0-9]\+//g' \
+            -e "$remove_debug_info" \
+            -e "$remove_offset_number" \
+            -e "$remove_size_of_area" \
+            -e "$remove_debug_pubnames" > "$testdir"/readelf-remote.txt
+        readelf -wlLiaprmfFoRt "$testdir"/debug-local.o | sed -e 's/offset: 0x[0-9a-fA-F]*//g' \
+            -e "$remove_debug_info" \
+            -e "$remove_offset_number" \
+            -e "$remove_size_of_area" \
+            -e "$remove_debug_pubnames" > "$testdir"/readelf-local.txt
+        if ! diff "$testdir"/readelf-local.txt "$testdir"/readelf-remote.txt >/dev/null; then
+            echo Readelf output different.
+            echo =====================
+            diff -u "$testdir"/readelf-local.txt "$testdir"/readelf-remote.txt
+            echo =====================
+            stop_ice 0
+            abort_tests
+        fi
+    elif file "$testdir"/debug-remote.o | grep Mach >/dev/null; then
+        # No idea how to check they are the same if they are not 100% identical
+        if ! diff "$testdir"/debug-local.o "$testdir"/debug-remote.o >/dev/null; then
+            echo "Output mismatch, Mach object files, not knowing how to verify"
+        fi
+    else
+        # possibly cygwin .o file, no idea how to check they are the same if they are not 100% identical
+        if ! diff "$testdir"/debug-local.o "$testdir"/debug-remote.o >/dev/null; then
+            echo "Output mismatch, assuming Cygwin object files, not knowing how to verify"
+        fi
     fi
-    rm "$testdir"/debug-remote.o "$testdir"/debug-local.o "$testdir"/debug-remote "$testdir"/debug-local "$testdir"/debug-*-*.txt "$testdir"/readelf-*.txt
+    rm -f "$testdir"/debug-remote.o "$testdir"/debug-local.o "$testdir"/debug-remote "$testdir"/debug-local "$testdir"/debug-*-*.txt "$testdir"/readelf-*.txt
 
     echo Debug test successful.
     echo
-
-    # restart local daemon to the as built one
-    kill_daemon localice
-    start_iceccd localice --no-remote -m 2
 }
 
 zero_local_jobs_test()
 {
-    echo Running zero_local_jobs test.
+    echo Running zero local jobs test.
 
-    reset_logs local "Running zero_local_jobs test"
-    reset_logs remote  "Running zero_local_jobs test"
+    reset_logs "" "Running zero local jobs test"
 
     kill_daemon localice
 
     start_iceccd localice --no-remote -m 0
+    wait_for_ice_startup_complete localice
 
     libdir="${testdir}/libs"
     rm -rf  "${libdir}"
     mkdir "${libdir}"
 
-    reset_logs remote $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
-    echo Running: $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
-    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
+    mark_logs remote $TESTCXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
+    echo Running: $TESTCXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $TESTCXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
     if [[ $? -ne 0 ]]; then
         echo "failed to build testfunc.o"
-        grep -q "AddressSanitizer failed to allocate"  "$testdir"/iceccdstderr_remoteice1.log
-        if [[ $? ]]; then
-            echo "address sanitizer broke, skipping test"
-            skipped_tests="$skipped_tests zero_local_jobs_test"
-            reset_logs local "skipping zero_local_jobs_test"
-            start_iceccd localice --no-remote -m 2
-            return 0
-        fi
         stop_ice 0
         abort_tests
     fi
 
-    reset_logs remote $GXX -Wall -Werror -c testmainfunc.cpp -o "${testdir}/testmainfunc.o"
-    echo Running: $GXX -Wall -Werror -c testmainfunc.cpp -o "${testdir}/testmainfunc.o"
-    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice2 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $GXX -Wall -Werror -c testmainfunc.cpp -o "${testdir}/testmainfunc.o"
+    mark_logs remote $TESTCXX -Wall -Werror -c testmainfunc.cpp -o "${testdir}/testmainfunc.o"
+    echo Running: $TESTCXX -Wall -Werror -c testmainfunc.cpp -o "${testdir}/testmainfunc.o"
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice2 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $TESTCXX -Wall -Werror -c testmainfunc.cpp -o "${testdir}/testmainfunc.o"
     if test $? -ne 0; then
         echo "Error, failed to compile testfunc.cpp"
         stop_ice 0
@@ -829,9 +1234,9 @@ zero_local_jobs_test()
         abort_tests
     fi
 
-    reset_logs local $GXX -Wall -Werror "-L${libdir}" "-ltestlib1" "-ltestlib2" -o "${testdir}/linkedapp"
-    echo Running: $GXX -Wall -Werror "-L${libdir}" "-ltestlib1" "-ltestlib2" -o "${testdir}/linkedapp"
-    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=localice ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $GXX -Wall -Werror "-L${libdir}" "-ltestlib1" "-ltestlib2" -o "${testdir}/linkedapp" 2>"$testdir"/stderr.remoteice
+    mark_logs local $TESTCXX -Wall -Werror "-L${libdir}" "-ltestlib1" "-ltestlib2" -o "${testdir}/linkedapp"
+    echo Running: $TESTCXX -Wall -Werror "-L${libdir}" "-ltestlib1" "-ltestlib2" -o "${testdir}/linkedapp"
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=localice ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $TESTCXX -Wall -Werror "-L${libdir}" "-ltestlib1" "-ltestlib2" -o "${testdir}/linkedapp" 2>>"$testdir"/stderr.log
     if test $? -ne 0; then
         echo "Error, failed to link testlib1 and testlib2 into linkedapp"
         stop_ice 0
@@ -849,49 +1254,184 @@ zero_local_jobs_test()
 
     kill_daemon localice
     start_iceccd localice --no-remote -m 2
+    wait_for_ice_startup_complete localice
 
-    echo zero_local_jobs test successful.
+    echo Zero local jobs test successful.
     echo
 }
 
+ccache_test()
+{
+    if ! command -v ccache >/dev/null; then
+        echo Could not find ccache, ccache tests skipped.
+        echo
+        skipped_tests="$skipped_tests ccache"
+        return
+    fi
+    reset_logs "verify" "Testing ccache error redirect"
+    echo Testing ccache error redirect.
+    # First check that everything actually works (the test itself doesn't have icecc debug enabled and uses only stderr, because of ccache).
+    rm -rf "$testdir/ccache"
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log \
+        CCACHE_PREFIX=${icecc} CCACHE_DIR="$testdir"/ccache ICECC_VERSION=testbrokenenv ccache $TESTCXX -Wall -Werror -c plain.cpp -o "$testdir/"plain.o 2>>"$testdir"/stderr.log
+    check_log_message icecc "ICECC_VERSION has to point to an existing file to be installed testbrokenenv"
+    # Second run, will get cached result, so there's no icecc error in ccache's cached stderr
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log \
+        CCACHE_PREFIX=${icecc} CCACHE_DIR="$testdir"/ccache ICECC_VERSION=testbrokenenv ccache $TESTCXX -Wall -Werror -c plain.cpp -o "$testdir/"plain.o 2>>"$testdir"/stderr.log
+    check_log_message_count icecc 1 "ICECC_VERSION has to point to an existing file to be installed testbrokenenv"
+
+    # Now run it again, this time without icecc debug redirected, so that ccache has to handle icecc's stderr.
+    reset_logs "cache" "Testing ccache error redirect"
+    rm -rf "$testdir/ccache"
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug \
+        CCACHE_PREFIX=${icecc} CCACHE_DIR="$testdir"/ccache ICECC_VERSION=testbrokenenv ccache $TESTCXX -Wall -Werror -c plain.cpp -o "$testdir/"plain.o 2>>"$testdir"/stderr.log
+    if cat_log_last_mark stderr | grep -q "UNCACHED_ERR_FD provides an invalid file descriptor"; then
+        echo UNCACHED_ERR_FD provided by ccache is invalid, skipping test.
+        echo
+        skipped_tests="$skipped_tests ccache"
+        return
+    fi
+    if ! cat_log_last_mark stderr | grep -q "ICECC_VERSION has to point to an existing file to be installed testbrokenenv"; then
+        # If ccache's UNCACHED_ERR_FD handling is broken, the fd number may match an unrelated open fd, in which case the log message just disappears.
+        echo Missing icecc stderr output from ccache, assuming broken ccache, skipping test.
+        echo
+        skipped_tests="$skipped_tests ccache"
+        return
+    fi
+    # second run, will get cached result, so there's no icecc error in ccache's cached stderr
+    reset_logs "test" "Testing ccache error redirect"
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 \
+        CCACHE_PREFIX=${icecc} CCACHE_DIR="$testdir"/ccache ICECC_VERSION=testbrokenenv ccache $TESTCXX -Wall -Werror -c plain.cpp -o "$testdir/"plain.o 2>>"$testdir"/stderr.log
+    check_section_log_error stderr "ICECC_VERSION has to point to an existing file to be installed testbrokenenv"
+    echo Testing ccache error redirect successful.
+    echo
+}
+
+# All log files that are used by tests. Done here to keep the list in just one place.
+daemonlogs="scheduler scheduler2 localice remoteice1 remoteice2"
+otherlogs="icecc stderr stderr.localice stderr.remoteice"
+alltestlogs="$daemonlogs $otherlogs"
+
+# Call this at the start of a complete test (e.g. testing a feature). If a test fails, logs before this point will not be dumped.
 reset_logs()
 {
     type="$1"
     shift
-    # in case icecc.log or stderr.log don't exit, avoid error message
-    touch "$testdir"/icecc.log "$testdir"/stderr.log
-    for log in scheduler localice remoteice1 remoteice2 icecc stderr; do
-        # save (append) previous log
-        cat "$testdir"/${log}.log >> "$testdir"/${log}_all.log
-        # and start a new one
-        echo ============== > "$testdir"/${log}.log
-        echo "Test ($type): $@" >> "$testdir"/${log}.log
-        echo ============== >> "$testdir"/${log}.log
-        if test "$log" != icecc -a "$log" != stderr; then
-            pid=${log}_pid
-            if test -n "${!pid}"; then
-                kill -HUP ${!pid}
-            fi
-        fi
-    done
+    last_reset_log_mark=$flush_log_mark
+    mark_logs $type "$@"
 }
 
-finish_logs()
+# Call this at the start of a sub-test (e.g. remote vs local build). Functions such as check_log_message will not check before the mark.
+mark_logs()
 {
-    for log in scheduler localice remoteice1 remoteice2 icecc stderr; do
-        cat "$testdir"/${log}.log >> "$testdir"/${log}_all.log
-        rm -f "$testdir"/${log}.log
+    type="$1"
+    shift
+    last_section_log_mark=$flush_log_mark
+    echo ================ > "$testdir"/log_header.txt
+    if test -n "$type"; then
+        echo "= Test ($type): $@" >> "$testdir"/log_header.txt
+    else
+        echo "= Test : $@" >> "$testdir"/log_header.txt
+    fi
+    echo ================ >> "$testdir"/log_header.txt
+    # Make daemons write the header.
+    flush_logs
+    manual="$otherlogs"
+    for daemon in $daemonlogs; do
+        pid=${daemon}_pid
+        if test -n "${!pid}"; then
+            kill -0 ${!pid}
+            if test $? -ne 0; then
+                manual="$manual $daemon"
+            fi
+        else
+            manual="$manual $daemon"
+        fi
     done
+    for log in $manual; do
+        cat "$testdir"/log_header.txt >> "$testdir"/${log}.log
+    done
+    rm "$testdir"/log_header.txt
 }
 
 flush_logs()
 {
-    for daemon in scheduler localice remoteice1 remoteice2; do
+    echo "=${flush_log_mark}=" > "$testdir"/flush_log_mark.txt
+    wait_for=
+    manual="$otherlogs"
+    for daemon in $daemonlogs; do
         pid=${daemon}_pid
         if test -n "${!pid}"; then
             kill -HUP ${!pid}
+            if test $? -eq 0; then
+                wait_for="$wait_for $daemon"
+            else
+                manual="$manual $daemon"
+            fi
+        else
+            manual="$manual $daemon"
         fi
     done
+    # wait for all daemons to log the mark in their log
+    while test -n "$wait_for"; do
+        ready=1
+        for daemon in $wait_for; do
+            if ! grep -q "flush log mark: =${flush_log_mark}=" "$testdir"/${daemon}.log; then
+                ready=
+            fi
+        done
+        if test -n "$ready"; then
+            break
+        fi
+    done
+    for log in $manual; do
+        echo "flush log mark: =${flush_log_mark}=" >> "$testdir"/${log}.log
+    done
+    rm "$testdir"/flush_log_mark.txt
+    flush_log_mark=$((flush_log_mark + 1))
+}
+
+dump_logs()
+{
+    for log in $alltestlogs; do
+        # Skip logs that have only headers and flush marks
+        if cat_log_last_section ${log} | grep -q -v "^="; then
+            echo ------------------------------------------------
+            echo "Log: ${log}"
+            cat_log_last_section ${log}
+        fi
+    done
+    valgrind_logs=$(ls "$testdir"/valgrind-*.log 2>/dev/null)
+    for log in $valgrind_logs; do
+        has_error=
+        if test -n "$valgrind_error_markers"; then
+            if grep -q ICEERRORBEGIN ${log}; then
+                has_error=1
+            fi
+        else
+            # Let's guess that every error message has this.
+            if grep -q '^==[0-9]*==    at ' ${log}; then
+                has_error=1
+            fi
+        fi
+        if  test -n "$has_error"; then
+            echo ------------------------------------------------
+            echo "Log: ${log}" | sed "s#${testdir}/##"
+            grep -v ICEERRORBEGIN ${log} | grep -v ICEERROREND
+        fi
+    done
+}
+
+cat_log_last_mark()
+{
+    log="$1"
+    grep -A 100000 "flush log mark: =${last_section_log_mark}=" "$testdir"/${log}.log | grep -v "flush log mark: "
+}
+
+cat_log_last_section()
+{
+    log="$1"
+    grep -A 100000 "flush log mark: =${last_reset_log_mark}=" "$testdir"/${log}.log | grep -v "flush log mark: "
 }
 
 check_logs_for_generic_errors()
@@ -899,16 +1439,52 @@ check_logs_for_generic_errors()
     check_log_error scheduler "that job isn't handled by"
     check_log_error scheduler "the server isn't the same for job"
     check_log_error icecc "got exception "
+    check_log_error icecc "found another non option on command line. Two input files"
+    check_log_error localice "Ignoring bogus version"
+    check_log_error remoteice1 "Ignoring bogus version"
+    check_log_error remoteice2 "Ignoring bogus version"
+    check_log_error localice "scheduler closed connection"
+    check_log_error remoteice1 "scheduler closed connection"
+    check_log_error remoteice2 "scheduler closed connection"
     # consider all non-fatal errors such as running out of memory on the remote
     # still as problems, except for:
     # 102 - -fdiagnostics-show-caret forced local build (gcc-4.8+)
-    check_log_error_except icecc "local build forced" "local build forced by remote exception: Error 102 - command needs stdout/stderr workaround, recompiling locally"
+    if test -n "$using_gcc"; then
+        check_log_error_except icecc "local build forced" "local build forced by remote exception: Error 102 - command needs stdout/stderr workaround, recompiling locally"
+    else
+        check_log_error icecc "local build forced"
+    fi
+    has_valgrind_error=
+    if test -n "$valgrind_error_markers"; then
+        if grep -q "ICEERRORBEGIN" "$testdir"/valgrind-*.log 2>/dev/null; then
+            has_valgrind_error=1
+        fi
+    else
+        if grep -q '^==[0-9]*==    at ' "$testdir"/valgrind-*.log 2>/dev/null; then
+            has_valgrind_error=1
+        fi
+    fi
+    if test -n "$has_valgrind_error"; then
+        echo Valgrind detected an error, aborting.
+        stop_ice 0
+        abort_tests
+    fi
 }
 
 check_log_error()
 {
     log="$1"
-    if grep -q "$2" "$testdir"/${log}.log; then
+    if cat_log_last_mark ${log} | grep -q "$2"; then
+        echo "Error, $log log contains error: $2"
+        stop_ice 0
+        abort_tests
+    fi
+}
+
+check_section_log_error()
+{
+    log="$1"
+    if cat_log_last_section ${log} | grep -q "$2"; then
         echo "Error, $log log contains error: $2"
         stop_ice 0
         abort_tests
@@ -920,7 +1496,7 @@ check_log_error()
 check_log_error_except()
 {
     log="$1"
-    if cat "$testdir"/${log}.log | grep -v "$3" | grep -q "$2" ; then
+    if cat_log_last_mark ${log} | grep -v "$3" | grep -q "$2" ; then
         echo "Error, $log log contains error: $2"
         stop_ice 0
         abort_tests
@@ -930,7 +1506,17 @@ check_log_error_except()
 check_log_message()
 {
     log="$1"
-    if ! grep -q "$2" "$testdir"/${log}.log; then
+    if ! cat_log_last_mark ${log} | grep -q "$2"; then
+        echo "Error, $log log does not contain: $2"
+        stop_ice 0
+        abort_tests
+    fi
+}
+
+check_section_log_message()
+{
+    log="$1"
+    if ! cat_log_last_section ${log} | grep -q "$2"; then
         echo "Error, $log log does not contain: $2"
         stop_ice 0
         abort_tests
@@ -941,7 +1527,7 @@ check_log_message_count()
 {
     log="$1"
     expected_count="$2"
-    count=`grep "$3" "$testdir"/${log}.log | wc -l`
+    count=$(cat_log_last_mark ${log} | grep "$3" | wc -l)
     if test $count -ne $expected_count; then
         echo "Error, $log log does not contain expected count (${count} vs ${expected_count}): $3"
         stop_ice 0
@@ -949,87 +1535,238 @@ check_log_message_count()
     fi
 }
 
+check_section_log_message_count()
+{
+    log="$1"
+    expected_count="$2"
+    count=$(cat_log_last_section ${log} | grep "$3" | wc -l)
+    if test $count -ne $expected_count; then
+        echo "Error, $log log does not contain expected count (${count} vs ${expected_count}): $3"
+        stop_ice 0
+        abort_tests
+    fi
+}
+
+
+# ==================================================================
+# Main code starts here
+# ==================================================================
+
+echo
+
+check_compilers
+
+stop_ice 2
+for log in $alltestlogs; do
+    rm -f "$testdir"/${log}.log
+    rm -f "$testdir"/${log}_section.log
+    rm -f "$testdir"/${log}_all.log
+    echo -n >"$testdir"/${log}.log
+done
+rm -f "$testdir"/valgrind-*.log 2>/dev/null
+
 buildnativetest
 
-rm -f "$testdir"/scheduler_all.log
-rm -f "$testdir"/localice_all.log
-rm -f "$testdir"/remoteice1_all.log
-rm -f "$testdir"/remoteice2_all.log
-rm -f "$testdir"/icecc_all.log
-rm -f "$testdir"/stderr_all.log
-echo -n >"$testdir"/scheduler.log
-echo -n >"$testdir"/localice.log
-echo -n >"$testdir"/remoteice1.log
-echo -n >"$testdir"/remoteice2.log
-echo -n >"$testdir"/icecc.log
-echo -n >"$testdir"/stderr.log
-
 echo Starting icecream.
-stop_ice 2
 reset_logs local "Starting"
 start_ice
 check_logs_for_generic_errors
 echo Starting icecream successful.
 echo
 
-if test -z "$chroot_disabled"; then
-    make_test 1
-    make_test 2
-fi
+run_ice "$testdir/plain.o" "remote" 0 $TESTCXX -Wall -Werror -c plain.cpp -o "$testdir/"plain.o
 
-if test -z "$debug_fission_disabled"; then
-    run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" $GXX -Wall -Werror -gsplit-dwarf -g -c plain.cpp -o "$testdir/"plain.o
-fi
-run_ice "$testdir/plain.o" "remote" 0 $GXX -Wall -Werror -c plain.cpp -o "$testdir/"plain.o
+run_ice "$testdir/plain.o" "remote" 0 $TESTCC -Wall -Werror -c plain.c -o "$testdir/"plain.o
+run_ice "$testdir/plain.o" "remote" 0 $TESTCXX -Wall -Werror -c plain.cpp -O2 -o "$testdir/"plain.o
+run_ice "$testdir/plain.ii" "local" 0 $TESTCXX -Wall -Werror -E plain.cpp -o "$testdir/"plain.ii
+run_ice "$testdir/includes.o" "remote" 0 $TESTCXX -Wall -Werror -c includes.cpp -o "$testdir"/includes.o
+run_ice "$testdir/includes.o" "remote" 0 $TESTCXX -Wall -Werror -c includes-without.cpp -include includes.h -o "$testdir"/includes.o
+run_ice "$testdir/plain.o" "local" 0 $TESTCXX -Wall -Werror -c plain.cpp -mtune=native -o "$testdir"/plain.o
+run_ice "$testdir/plain.o" "remote" 0 $TESTCC -Wall -Werror -x c++ -c plain -o "$testdir"/plain.o
 
-if test -z "$debug_fission_disabled"; then
-    run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" $GCC -Wall -Werror -gsplit-dwarf -c plain.c -o "$testdir/"plain.o
-    run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" $GCC -Wall -Werror -gsplit-dwarf -c plain.c -o "../../../../../../../..$testdir/plain.o"
-fi
-run_ice "$testdir/plain.o" "remote" 0 $GCC -Wall -Werror -c plain.c -o "$testdir/"plain.o
-run_ice "$testdir/plain.o" "remote" 0 $GXX -Wall -Werror -c plain.cpp -O2 -o "$testdir/"plain.o
-run_ice "$testdir/plain.ii" "local" 0 $GXX -Wall -Werror -E plain.cpp -o "$testdir/"plain.ii
-run_ice "$testdir/includes.o" "remote" 0 $GXX -Wall -Werror -c includes.cpp -o "$testdir"/includes.o
-run_ice "$testdir/plain.o" "local" 0 $GXX -Wall -Werror -c plain.cpp -mtune=native -o "$testdir"/plain.o
-run_ice "$testdir/plain.o" "remote" 0 $GCC -Wall -Werror -x c++ -c plain -o "$testdir"/plain.o
-if test -z "$debug_fission_disabled"; then
-    run_ice "" "remote" 300 "split_dwarf" $GXX -gsplit-dwarf -c nonexistent.cpp
-fi
+run_ice "$testdir/testdefine.o" "remote" 0 $TESTCXX -Wall -Werror -DICECREAM_TEST_DEFINE=test -c testdefine.cpp -o "$testdir/"testdefine.o
+run_ice "$testdir/testdefine.o" "remote" 0 $TESTCXX -Wall -Werror -D ICECREAM_TEST_DEFINE=test -c testdefine.cpp -o "$testdir/"testdefine.o
 
-run_ice "" "remote" 300 $GXX -c nonexistent.cpp
-run_ice "" "local" 0 /bin/true
+run_ice "" "remote" 300 "remoteabort" $TESTCXX -c nonexistent.cpp
 
-if $GXX -E -fdiagnostics-show-caret messages.cpp >/dev/null 2>/dev/null; then
-    # gcc stderr workaround, icecream will force a local recompile
-    run_ice "" "remote" 1 "stderrfix" $GXX -c syntaxerror.cpp
-    run_ice "$testdir/messages.o" "remote" 0 "stderrfix" $GXX -Wall -c messages.cpp -o "$testdir"/messages.o
-    check_log_message stderr "warning: unused variable 'unused'"
-    # try again without the local recompile
-    run_ice "" "remote" 1 $GXX -c -fno-diagnostics-show-caret syntaxerror.cpp
-    run_ice "$testdir/messages.o" "remote" 0 $GXX -Wall -c -fno-diagnostics-show-caret messages.cpp -o "$testdir"/messages.o
-    check_log_message stderr "warning: unused variable 'unused'"
+if test -e /bin/true; then
+    run_ice "" "local" 0 /bin/true
+elif test -e /usr/bin/true; then
+    run_ice "" "local" 0 /usr/bin/true
 else
-    run_ice "" "remote" 1 $GXX -c syntaxerror.cpp
-    run_ice "$testdir/messages.o" "remote" 0 $GXX -Wall -c messages.cpp -o "$testdir"/messages.o
-    check_log_message stderr "warning: unused variable 'unused'"
+    skipped_tests="$skipped_tests run-true"
+fi
+
+run_ice "" "local" 300 "nostderrcheck" /bin/nonexistent-at-all-doesnt-exist
+
+run_ice "$testdir/warninginmacro.o" "remote" 0 $TESTCXX -Wall -Wextra -Werror -c warninginmacro.cpp -o "$testdir/"warninginmacro.o
+run_ice "$testdir/unusedmacro.o" "remote" 0 "unusedmacrohack" $TESTCXX -Wall -Wunused-macros -c unusedmacro.cpp -o "$testdir/unusedmacro.o"
+
+if $TESTCXX -cxx-isystem ./ -fsyntax-only -Werror -c includes.cpp 2>/dev/null; then
+    run_ice "$testdir/includes.o" "remote" 0 $TESTCXX -Wall -Werror -cxx-isystem ./ -c includes.cpp -o "$testdir"/includes.o
+else
+    skipped_tests="$skipped_tests cxx-isystem"
+fi
+
+if test -n "$using_clang"; then
+    target=$($TESTCXX -dumpmachine)
+    run_ice "$testdir/plain.o" "remote" 0 $TESTCXX -Wall -Werror -target $target -c plain.cpp -o "$testdir"/plain.o
+    if test -z "$chroot_disabled"; then
+        check_section_log_message remoteice1 "remote compile arguments:.*-target $target"
+        run_ice "$testdir/plain.o" "remote" 0 $TESTCXX -Wall -Werror -c plain.cpp -o "$testdir"/plain.o
+        check_section_log_message remoteice1 "remote compile arguments:.*-target $target"
+    fi
+    run_ice "$testdir/plain.o" "remote" 0 $TESTCXX -Wall -Werror --target=$target -c plain.cpp -o "$testdir"/plain.o
+    if test -z "$chroot_disabled"; then
+        check_section_log_message remoteice1 "remote compile arguments:.*--target=$target"
+        check_section_log_error remoteice1 "remote compile arguments:.*-target $target"
+    fi
+else
+    skipped_tests="$skipped_tests target"
+fi
+
+debug_fission_disabled=1
+$TESTCXX -gsplit-dwarf true.cpp -o "$testdir"/true 2>/dev/null >/dev/null
+if test $? -eq 0; then
+    "$testdir"/true
+    if test $? -eq 0; then
+        debug_fission_disabled=
+    fi
+    rm -f "$testdir"/true "$testdir"/true.dwo true.dwo
+fi
+
+if test -n "$debug_fission_disabled"; then
+    skipped_tests="$skipped_tests split-dwarf"
+fi
+if test -z "$debug_fission_disabled"; then
+    run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" $TESTCXX -Wall -Werror -gsplit-dwarf -g -c plain.cpp -o "$testdir/"plain.o
+    run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" $TESTCC -Wall -Werror -gsplit-dwarf -c plain.c -o "$testdir/"plain.o
+    run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" $TESTCC -Wall -Werror -gsplit-dwarf -c plain.c -o "../../../../../../../..$testdir/plain.o"
+    run_ice "" "remote" 300 "split_dwarf" "remoteabort" $TESTCXX -gsplit-dwarf -c nonexistent.cpp
+fi
+
+if test -z "$chroot_disabled"; then
+    if test -z "$using_gcc"; then
+        run_ice "" "remote" 1 $TESTCXX -c syntaxerror.cpp
+        check_section_log_error icecc "local build forced by remote exception: Error 102 - command needs stdout/stderr workaround, recompiling locally"
+        run_ice "$testdir/messages.o" "remote" 0 $TESTCXX -Wall -c messages.cpp -o "$testdir"/messages.o
+        check_log_message stderr "warning: unused variable 'unused'"
+        check_section_log_error icecc "local build forced by remote exception: Error 102 - command needs stdout/stderr workaround, recompiling locally"
+    else
+        if $TESTCXX -E -fdiagnostics-show-caret -Werror messages.cpp >/dev/null 2>/dev/null; then
+            # check gcc stderr workaround, icecream will force a local recompile
+            run_ice "" "remote" 1 "stderrfix" $TESTCXX -c -fdiagnostics-show-caret syntaxerror.cpp
+            run_ice "$testdir/messages.o" "remote" 0 "stderrfix" $TESTCXX -Wall -c -fdiagnostics-show-caret messages.cpp -o "$testdir"/messages.o
+            check_log_message stderr "warning: unused variable 'unused'"
+            check_section_log_message icecc "local build forced by remote exception: Error 102 - command needs stdout/stderr workaround, recompiling locally"
+            # try again without the local recompile
+            run_ice "" "remote" 1 $TESTCXX -c -fno-diagnostics-show-caret syntaxerror.cpp
+            run_ice "$testdir/messages.o" "remote" 0 $TESTCXX -Wall -c -fno-diagnostics-show-caret messages.cpp -o "$testdir"/messages.o
+            check_log_message stderr "warning: unused variable 'unused'"
+            check_section_log_error icecc "local build forced by remote exception: Error 102 - command needs stdout/stderr workaround, recompiling locally"
+        else
+            # This gcc is too old to have this problem, but we do not check the gcc version in icecc.
+            run_ice "" "remote" 1 "stderrfix" $TESTCXX -c syntaxerror.cpp
+            check_section_log_message icecc "local build forced by remote exception: Error 102 - command needs stdout/stderr workaround, recompiling locally"
+            run_ice "$testdir/messages.o" "remote" 0 "stderrfix" $TESTCXX -Wall -c messages.cpp -o "$testdir"/messages.o
+            check_log_message stderr "warning: unused variable 'unused'"
+            check_section_log_message icecc "local build forced by remote exception: Error 102 - command needs stdout/stderr workaround, recompiling locally"
+        fi
+    fi
+else
+    skipped_tests="$skipped_tests gcc-caret"
 fi
 
 if command -v gdb >/dev/null; then
     if command -v readelf >/dev/null; then
-        debug_test "$GXX" "-c -g debug.cpp" "Temporary breakpoint 1, main () at debug.cpp:8"
+        debug_test "$TESTCXX" "-c -g debug.cpp" "Temporary breakpoint 1, main () at debug.cpp:8"
+        debug_test "$TESTCXX" "-c -g $(pwd)/debug/debug2.cpp" "Temporary breakpoint 1, main () at $(pwd)/debug/debug2.cpp:8"
         if test -z "$debug_fission_disabled"; then
-            debug_test "$GXX" "-c -g debug.cpp -gsplit-dwarf" "Temporary breakpoint 1, main () at debug.cpp:8"
-            debug_test "$GXX" "-c -g `pwd`/debug/debug2.cpp -gsplit-dwarf" "Temporary breakpoint 1, main () at `pwd`/debug/debug2.cpp:8"
+            debug_test "$TESTCXX" "-c -g debug.cpp -gsplit-dwarf" "Temporary breakpoint 1, main () at debug.cpp:8"
+            debug_test "$TESTCXX" "-c -g $(pwd)/debug/debug2.cpp -gsplit-dwarf" "Temporary breakpoint 1, main () at $(pwd)/debug/debug2.cpp:8"
         fi
-        debug_test "$GXX" "-c -g `pwd`/debug/debug2.cpp" "Temporary breakpoint 1, main () at `pwd`/debug/debug2.cpp:8"
     fi
 else
     skipped_tests="$skipped_tests debug"
 fi
 
-icerun_test
+if $TESTCXX -fsanitize=address -Werror fsanitize.cpp -o /dev/null >/dev/null 2>/dev/null; then
+    run_ice "$testdir/fsanitize.o" "remote" 0 keepoutput $TESTCXX -c -fsanitize=address -g fsanitize.cpp -o "$testdir"/fsanitize.o
+    $TESTCXX -fsanitize=address -g "$testdir"/fsanitize.o -o "$testdir"/fsanitize 2>>"$testdir"/stderr.log
+    if test $? -ne 0; then
+        echo "Linking for -fsanitize test failed."
+        stop_ice 0
+        abort_tests
+    fi
+    "$testdir"/fsanitize 2>>"$testdir"/stderr.log
+    check_log_message stderr "ERROR: AddressSanitizer: heap-use-after-free"
+    # Only newer versions of ASAN have the SUMMARY line.
+    if grep -q "^SUMMARY:" "$testdir"/stderr.log; then
+        check_log_message stderr "SUMMARY: AddressSanitizer: heap-use-after-free .*fsanitize.cpp:5.* test_fsanitize_function()"
+    fi
+    rm "$testdir"/fsanitize.o
+
+    if $TESTCXX -fsanitize=address -fsanitize-blacklist=fsanitize-blacklist.txt -c -fsyntax-only fsanitize.cpp >/dev/null 2>/dev/null; then
+        run_ice "" "local" 300 $TESTCXX -c -fsanitize=address -fsanitize-blacklist=nonexistent -g fsanitize.cpp -o "$testdir"/fsanitize.o
+        check_section_log_message icecc "file for argument -fsanitize-blacklist=nonexistent missing, building locally"
+
+        run_ice "$testdir/fsanitize.o" "remote" 0 keepoutput $TESTCXX -c -fsanitize=address -fsanitize-blacklist=fsanitize-blacklist.txt -g fsanitize.cpp -o "$testdir"/fsanitize.o
+        $TESTCXX -fsanitize=address -fsanitize-blacklist=fsanitize-blacklist.txt  -g "$testdir"/fsanitize.o -o "$testdir"/fsanitize 2>>"$testdir"/stderr.log
+        if test $? -ne 0; then
+            echo "Linking for -fsanitize test failed."
+            stop_ice 0
+            abort_tests
+        fi
+        "$testdir"/fsanitize 2>>"$testdir"/stderr.log
+        check_log_error stderr "ERROR: AddressSanitizer: heap-use-after-free"
+        if grep -q "^SUMMARY:" "$testdir"/stderr.log; then
+            check_log_error stderr "SUMMARY: AddressSanitizer: heap-use-after-free .*fsanitize.cpp:5 in test()"
+        fi
+        rm "$testdir"/fsanitize.o
+    else
+        skipped_tests="$skipped_tests fsanitize-blacklist"
+    fi
+else
+    skipped_tests="$skipped_tests fsanitize"
+fi
+
+# test -frewrite-includes usage
+$TESTCXX -E -Werror -frewrite-includes messages.cpp 2>/dev/null | grep -q '^# 1 "messages.cpp"$' >/dev/null 2>/dev/null
+if test $? -eq 0; then
+    run_ice "$testdir/messages.o" "remote" 0 $TESTCXX -Wall -c messages.cpp -o "$testdir"/messages.o
+    check_log_message stderr "warning: unused variable 'unused'"
+else
+    echo $TESTCXX does not provide functional -frewrite-includes, skipping test.
+    echo
+    skipped_tests="$skipped_tests clang_rewrite_includes"
+fi
+
+run_ice "$testdir/includes.h.gch" "local" 0 "keepoutput" $TESTCXX -x c++-header -Wall -Werror -c includes.h -o "$testdir"/includes.h.gch
+run_ice "$testdir/includes.o" "remote" 0 $TESTCXX -Wall -Werror -c includes.cpp -include "$testdir"/includes.h -o "$testdir"/includes.o
+if test -n "$using_clang"; then
+    run_ice "$testdir/includes.o" "remote" 0 $TESTCXX -Wall -Werror -c includes.cpp -include-pch "$testdir"/includes.h.gch -o "$testdir"/includes.o
+fi
+rm "$testdir"/includes.h.gch
+
+if test -n "$using_clang"; then
+    clangplugintest
+else
+    skipped_tests="$skipped_tests clangplugin"
+fi
+
+icerun_serialize_test
+icerun_nopath_test
+icerun_nocompile_test
 
 recursive_test
+
+ccache_test
+
+if test -z "$chroot_disabled"; then
+    make_test
+else
+    skipped_tests="$skipped_tests make_test"
+fi
 
 if test -z "$chroot_disabled"; then
     zero_local_jobs_test
@@ -1037,59 +1774,64 @@ else
     skipped_tests="$skipped_tests zero_local_jobs_test"
 fi
 
-if test -x $CLANGXX; then
-    # There's probably not much point in repeating all tests with Clang, but at least
-    # try it works (there's a different icecc-create-env run needed, and -frewrite-includes
-    # usage needs checking).
-    # Clang writes the input filename in the resulting .o , which means the outputs
-    # cannot match (remote node will use stdin for the input, while icecc always
-    # builds locally if it itself gets data from stdin). It'd be even worse with -g,
-    # since the -frewrite-includes transformation apparently makes the debugginfo
-    # differ too (although the end results work just as well). So just do not compare.
-    # It'd be still nice to check at least somehow that this really works though.
-    run_ice "" "remote" 0 $CLANGXX -Wall -Werror -c plain.cpp -o "$testdir"/plain.o
-    rm "$testdir"/plain.o
-    run_ice "" "remote" 0 $CLANGXX -Wall -Werror -c includes.cpp -o "$testdir"/includes.o
-    rm "$testdir"/includes.o
-    run_ice "" "remote" 0 $CLANGXX -Wall -Werror -cxx-isystem ./ -c includes.cpp -o "$testdir"/includes.o
-    rm "$testdir"/includes.o
-    run_ice "" "remote" 0 $CLANGXX -Wall -Werror -target x86_64-linux-gnu -c includes.cpp -o "$testdir"/includes.o
-    rm "$testdir"/includes.o
+if test -z "$chroot_disabled"; then
+    echo Testing different netnames.
+    reset_logs remote "Different netnames"
+    stop_ice 1
+    # Start the secondary scheduler before the primary, so that besides the different netname it would be the preferred scheduler.
+    ICECC_TESTS=1 ICECC_TEST_SCHEDULER_PORTS=8767:8769 \
+        ICECC_TEST_FLUSH_LOG_MARK="$testdir"/flush_log_mark.txt ICECC_TEST_LOG_HEADER="$testdir"/log_header.txt \
+        $valgrind "${icecc_scheduler}" -p 8769 -l "$testdir"/scheduler2.log -n ${netname}_secondary -v -v -v &
+    scheduler2_pid=$!
+    echo $scheduler2_pid > "$testdir"/scheduler2.pid
+    wait_for_ice_startup_complete scheduler2
+    start_ice
+    check_log_message scheduler2 "Received scheduler announcement from .* (version $protocolversion, netname ${netname})"
+    check_log_error scheduler "has announced itself as a preferred scheduler, disconnecting all connections"
+    check_log_message localice "Ignoring scheduler at .*:8769 because of a different netname (${netname}_secondary)"
+    check_log_message remoteice1 "Ignoring scheduler at .*:8769 because of a different netname (${netname}_secondary)"
+    check_log_message remoteice2 "Ignoring scheduler at .*:8769 because of a different netname (${netname}_secondary)"
+    stop_secondary_scheduler 1
+    echo Different netnames test successful.
+    echo
 
-    # test -frewrite-includes usage
-    $CLANGXX -E -Werror -frewrite-includes messages.cpp | grep -q '^# 1 "messages.cpp"$' >/dev/null 2>/dev/null
-    if test $? -eq 0; then
-        run_ice "" "remote" 0 $CLANGXX -Wall -c messages.cpp -o "$testdir"/messages.o
-        check_log_message stderr "warning: unused variable 'unused'"
-        rm "$testdir"/messages.o
-    else
-        skipped_tests="$skipped_tests clang_rewrite_includes"
-    fi
+    echo Testing newer scheduler.
+    reset_logs remote "Newer scheduler"
+    # Make this scheduler fake its start time, so it should be the preferred scheduler.
+    # We could similarly fake the version to be higher, but this should be safer.
+    ICECC_TESTS=1 ICECC_TEST_SCHEDULER_PORTS=8767:8769 ICECC_FAKE_STARTTIME=1 \
+        ICECC_TEST_FLUSH_LOG_MARK="$testdir"/flush_log_mark.txt ICECC_TEST_LOG_HEADER="$testdir"/log_header.txt \
+        $valgrind "${icecc_scheduler}" -p 8769 -l "$testdir"/scheduler2.log -n ${netname} -v -v -v &
+    scheduler2_pid=$!
+    echo $scheduler2_pid > "$testdir"/scheduler2.pid
+    wait_for_ice_startup_complete scheduler2
+    # Give the primary scheduler time to disconnect all clients.
+    sleep 1
+    check_log_message scheduler "Received scheduler announcement from .* (version $protocolversion, netname ${netname})"
+    check_log_message scheduler "has announced itself as a preferred scheduler, disconnecting all connections"
+    check_log_error scheduler2 "has announced itself as a preferred scheduler, disconnecting all connections"
+    check_log_message localice "scheduler closed connection"
+    check_log_message remoteice1 "scheduler closed connection"
+    check_log_message remoteice2 "scheduler closed connection"
+    # Daemons will not connect to the secondary debug scheduler (not implemented).
+    stop_secondary_scheduler 1
+    echo Newer scheduler test successful.
+    echo
 
-    clang_debug_fission_disabled=
-    $CLANGXX -E -gsplit-dwarf messages.cpp 2>/dev/null >/dev/null || clang_debug_fission_disabled=1
-    if test -n "$debug_fission_disabled"; then
-        skipped_tests="$skipped_tests split-dwarf(clang++)"
-    fi
-
-    if command -v gdb >/dev/null; then
-        if command -v readelf >/dev/null; then
-            debug_test "$CLANGXX" "-c -g debug.cpp" "Temporary breakpoint 1, main () at debug.cpp:8"
-            if test -z "$clang_debug_fission_disabled"; then
-                debug_test "$CLANGXX" "-c -g debug.cpp -gsplit-dwarf" "Temporary breakpoint 1, main () at debug.cpp:8"
-                debug_test "$CLANGXX" "-c -g `pwd`/debug/debug2.cpp -gsplit-dwarf" "Temporary breakpoint 1, main () at `pwd`/debug/debug2.cpp:8"
-            fi
-            debug_test "$CLANGXX" "-c -g `pwd`/debug/debug2.cpp" "Temporary breakpoint 1, main () at `pwd`/debug/debug2.cpp:8"
-        fi
-    fi
-
-    if test -n "$builddir" -a -f "$builddir"/clangplugin.so; then
-        clangplugintest
-    else
-        skipped_tests="$skipped_tests clangplugin"
-    fi
+    echo Testing reconnect.
+    reset_logs remote "Reconnect"
+    wait_for_ice_startup_complete localice remoteice1 remoteice2
+    flush_logs
+    check_log_message scheduler "login localice protocol version: ${protocolversion}"
+    check_log_message scheduler "login remoteice1 protocol version: ${protocolversion}"
+    check_log_message scheduler "login remoteice2 protocol version: ${protocolversion}"
+    check_log_message localice "Connected to scheduler"
+    check_log_message remoteice1 "Connected to scheduler"
+    check_log_message remoteice2 "Connected to scheduler"
+    echo Reconnect test successful.
+    echo
 else
-    skipped_tests="$skipped_tests clang"
+    skipped_tests="$skipped_tests scheduler_multiple"
 fi
 
 reset_logs local "Closing down"
@@ -1100,20 +1842,49 @@ reset_logs local "Starting only daemon"
 start_only_daemon
 
 # even without scheduler, icerun should still serialize, but still run up to local number of jobs in parallel
-icerun_test "noscheduler"
+icerun_serialize_test "noscheduler"
 
 reset_logs local "Closing down (only daemon)"
 stop_only_daemon 1
 
-finish_logs
+buildnativewithsymlinktest
+buildnativewithwrappertest
 
 if test -n "$valgrind"; then
     rm -f "$testdir"/valgrind-*.log
 fi
 
+ignore=
+if test -n "$using_gcc"; then
+    # gcc (as of now) doesn't know these options, ignore these tests if they fail
+    ignore="cxx-isystem target fsanitize-blacklist clangplugin clang_rewrite_includes"
+elif test -n "$using_clang"; then
+    # clang seems to handle everything
+    ignore=
+fi
+ignored_tests=
+for item in $ignore; do
+    if echo " $skipped_tests " | grep -q "$item"; then
+        ignored_tests="$ignored_tests $item"
+        skipped_tests="${skipped_tests/$item/}"
+    fi
+    skipped_tests=$(echo $skipped_tests | sed 's/  / /g' | sed 's/^ //')
+done
+
+if test -n "$ignored_tests"; then
+    echo Ignored tests: $ignored_tests
+fi
+
 if test -n "$skipped_tests"; then
-    echo "All tests OK, some were skipped:$skipped_tests"
-    echo =============
+    if test -n "$strict"; then
+        echo "All executed tests passed, but some were skipped: $skipped_tests"
+        echo "Strict mode enabled, failing."
+        echo ==================================================
+        exit 1
+    else
+        echo "All tests OK, some were skipped: $skipped_tests"
+        echo =================================
+    fi
 else
     echo All tests OK.
     echo =============

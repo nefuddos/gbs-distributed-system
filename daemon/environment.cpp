@@ -32,59 +32,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#ifdef HAVE_SIGNAL_H
 #include <signal.h>
-#endif
 
 #include "comm.h"
 #include "exitcode.h"
 #include "util.h"
 
 using namespace std;
-
-#if 0
-static string read_fromFILE(FILE *f)
-{
-    string output;
-
-    if (!f) {
-        log_error() << "no pipe " << strerror(errno) << endl;
-        return output;
-    }
-
-    char buffer[100];
-
-    while (!feof(f)) {
-        size_t bytes = fread(buffer, 1, 99, f);
-        buffer[bytes] = 0;
-        output += buffer;
-    }
-
-    pclose(f);
-    return output;
-}
-
-static bool extract_version(string &version)
-{
-    string::size_type pos = version.find_last_of('\n');
-
-    if (pos == string::npos) {
-        return false;
-    }
-
-    while (pos + 1 == version.size()) {
-        version.resize(version.size() - 1);
-        pos = version.find_last_of('\n');
-
-        if (pos == string::npos) {
-            return false;
-        }
-    }
-
-    version = version.substr(pos + 1);
-    return true;
-}
-#endif
 
 size_t sumup_dir(const string &dir)
 {
@@ -416,6 +370,7 @@ int start_create_env(const string &basedir, uid_t user_uid, gid_t user_gid,
     int pos = 0;
     argv[pos++] = BINDIR "/icecc";
     argv[pos++] = "--build-native";
+    const int first_to_free = pos;
     argv[pos++] = strdup(compiler.c_str());
 
     for (list<string>::const_iterator it = extrafiles.begin(); it != extrafiles.end(); ++it) {
@@ -428,6 +383,9 @@ int start_create_env(const string &basedir, uid_t user_uid, gid_t user_gid,
         log_error() << BINDIR "/icecc --build-native failed" << endl;
         _exit(1);
     }
+    for( int i = first_to_free; i < pos; ++i )
+        free( (void*) argv[ i ] );
+    delete[] argv;
 
     _exit(0);
 }
@@ -805,7 +763,7 @@ bool verify_env(MsgChannel *client, const string &basedir, const string &target,
     }
 
     // child
-    reset_debug(0);
+    reset_debug();
     chdir_to_environment(client, dirname, user_uid, user_gid);
     execl("bin/true", "bin/true", (void*)NULL);
     log_perror("execl failed");

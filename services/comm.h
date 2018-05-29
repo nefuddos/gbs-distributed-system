@@ -36,7 +36,7 @@
 #include "job.h"
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 37
+#define PROTOCOL_VERSION 38
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
 
@@ -62,6 +62,7 @@
 #define IS_PROTOCOL_35(c) ((c)->protocol >= 35)
 #define IS_PROTOCOL_36(c) ((c)->protocol >= 36)
 #define IS_PROTOCOL_37(c) ((c)->protocol >= 37)
+#define IS_PROTOCOL_38(c) ((c)->protocol >= 38)
 
 enum MsgType {
     // so far unknown
@@ -175,6 +176,7 @@ public:
         return eof || instate == HAS_MSG;
     }
 
+    // Returns ture if there were no errors filling inbuf.
     bool read_a_bit(void);
 
     bool at_eof(void) const
@@ -264,6 +266,21 @@ public:
     static MsgChannel *createChannel(int remote_fd, struct sockaddr *, socklen_t);
 };
 
+class Broadcasts
+{
+public:
+    // Broadcasts a message about this scheduler and its information.
+    static void broadcastSchedulerVersion(int scheduler_port, const char* netname, time_t starttime);
+    // Checks if the data received is a scheduler version broadcast.
+    static bool isSchedulerVersion(const char* buf, int buflen);
+    // Reads data from a scheduler version broadcast.
+    static void getSchedulerVersionData( const char* buf, int* protocol, time_t* time, std::string* netname );
+    /// Broadcasts the given data on the given port.
+    static const int BROAD_BUFLEN = 268;
+private:
+    static void broadcastData(int port, const char* buf, int size);
+};
+
 // --------------------------------------------------------------------------
 // this class is also used by icecream-monitor
 class DiscoverSched
@@ -316,8 +333,15 @@ public:
         return netname;
     }
 
-    /// Broadcasts the given data on the given port.
-    static bool broadcastData(int port, const char* buf, int size);
+    /* Return a list of all reachable netnames.  We wait max. WAITTIME
+       milliseconds for answers.  */
+    static std::list<std::string> getNetnames(int waittime = 2000, int port = 8765);
+
+    // Checks if the data is from a scheduler discovery broadcast, returns version of the sending
+    // daemon is yes.
+    static bool isSchedulerDiscovery(const char* buf, int buflen, int* daemon_version);
+    // Prepares data for sending a reply to a scheduler discovery broadcast.
+    static int prepareBroadcastReply(char* buf, const char* netname, time_t starttime);
 
 private:
     struct sockaddr_in remote_addr;
@@ -325,13 +349,20 @@ private:
     std::string schedname;
     int timeout;
     int ask_fd;
+    int ask_second_fd; // for debugging
     time_t time0;
     unsigned int sport;
     int best_version;
     time_t best_start_time;
+    std::string best_schedname;
+    int best_port;
     bool multiple;
 
     void attempt_scheduler_connect();
+    void sendSchedulerDiscovery( int version );
+    static bool get_broad_answer(int ask_fd, int timeout, char *buf2, struct sockaddr_in *remote_addr,
+                 socklen_t *remote_len);
+    static void get_broad_data(const char* buf, const char** name, int* version, time_t* start_time);
 };
 // --------------------------------------------------------------------------
 
@@ -644,7 +675,7 @@ public:
 class LoginMsg : public Msg
 {
 public:
-    LoginMsg(unsigned int myport, const std::string &_nodename, const std::string _host_platform);
+    LoginMsg(unsigned int myport, const std::string &_nodename, const std::string &_host_platform);
     LoginMsg()
         : Msg(M_LOGIN)
         , port(0) {}

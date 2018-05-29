@@ -1,9 +1,10 @@
 bin_PROGRAMS = icecc
-bin_SCRIPTS = icecc-create-env
+bin_SCRIPTS = icecc-create-env icecc-test-env
 
 noinst_LIBRARIES = libclient.a
 libclient_a_SOURCES = \
         arg.cpp \
+        argv.c \
         cpp.cpp \
         local.cpp \
         remote.cpp \
@@ -12,7 +13,7 @@ libclient_a_SOURCES = \
         safeguard.cpp
 
 icecc_SOURCES = \
-	main.cpp 
+	main.cpp
 icecc_LDADD = \
 	libclient.a \
 	../services/libicecc.la \

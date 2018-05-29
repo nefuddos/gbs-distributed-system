@@ -52,6 +52,7 @@
 #include "../services/comm.h"
 #include "../services/logging.h"
 #include "../services/job.h"
+#include "../services/util.h"
 #include "config.h"
 
 #include "compileserver.h"
@@ -121,7 +122,6 @@ static list<JobStat> all_job_stats;
 static JobStat cum_job_stats;
 
 static float server_speed(CompileServer *cs, Job *job = 0);
-static void broadcast_scheduler_version(const char* netname);
 
 /* Searches the queue for JOB and removes it.
    Returns true if something was deleted.  */
@@ -306,16 +306,16 @@ static void handle_monitor_stats(CompileServer *cs, StatsMsg *m = 0)
     if (m) {
         sprintf(buffer, "Load:%d\n", m->load);
         msg += buffer;
-        sprintf(buffer, "LoadAvg1:%d\n", m->loadAvg1);
+        sprintf(buffer, "LoadAvg1:%u\n", m->loadAvg1);
         msg += buffer;
-        sprintf(buffer, "LoadAvg5:%d\n", m->loadAvg5);
+        sprintf(buffer, "LoadAvg5:%u\n", m->loadAvg5);
         msg += buffer;
-        sprintf(buffer, "LoadAvg10:%d\n", m->loadAvg10);
+        sprintf(buffer, "LoadAvg10:%u\n", m->loadAvg10);
         msg += buffer;
-        sprintf(buffer, "FreeMem:%d\n", m->freeMem);
+        sprintf(buffer, "FreeMem:%u\n", m->freeMem);
         msg += buffer;
     } else {
-        sprintf(buffer, "Load:%d\n", cs->load());
+        sprintf(buffer, "Load:%u\n", cs->load());
         msg += buffer;
     }
 
@@ -392,7 +392,26 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
         job->setEnvironments(m->versions);
         job->setTargetPlatform(m->target);
         job->setArgFlags(m->arg_flags);
-        job->setLanguage((m->lang == CompileJob::Lang_C) ? "C" : "C++");
+        switch(m->lang) {
+            case CompileJob::Lang_C:
+                job->setLanguage("C");
+                break;
+            case CompileJob::Lang_CXX:
+                job->setLanguage("C++");
+                break;
+            case CompileJob::Lang_OBJC:
+                job->setLanguage("ObjC");
+                break;
+            case CompileJob::Lang_OBJCXX:
+                job->setLanguage("ObjC++");
+                break;
+            case CompileJob::Lang_Custom:
+                job->setLanguage("<custom>");
+                break;
+            default:
+                job->setLanguage("???"); // presumably newer client?
+                break;
+        }
         job->setFileName(m->filename);
         job->setLocalClientId(m->client_id);
         job->setPreferredHost(m->preferred_host);
@@ -555,18 +574,6 @@ static CompileServer *pick_server(Job *job)
         }
 
         return 0;
-    }
-
-    /* Now guess about the job.  First see, if this submitter already
-       had other jobs.  Use them as base.  */
-    JobStat guess;
-
-    if (job->submitter()->lastRequestedJobs().size() > 0) {
-        guess = job->submitter()->cumRequested()
-                / job->submitter()->lastRequestedJobs().size();
-    } else {
-        /* Otherwise simply average over all jobs.  */
-        guess = cum_job_stats / all_job_stats.size();
     }
 
     CompileServer *best = 0;
@@ -1284,7 +1291,7 @@ static string dump_job(Job *job)
     default:
         jobState = "Huh?";
     }
-    snprintf(buffer, sizeof(buffer), "%d %s sub:%s on:%s ",
+    snprintf(buffer, sizeof(buffer), "%u %s sub:%s on:%s ",
              job->id(),
              jobState.c_str(),
              job->submitter() ? job->submitter()->nodeName().c_str() : "<>",
@@ -1347,7 +1354,6 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         return false;
     }
 
-    char buffer[1000];
     string line;
     list<string> l;
     split_string(m->text, " \t\n", l);
@@ -1365,6 +1371,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
 
     if (cmd == "listcs") {
         for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
+            char buffer[1000];
             sprintf(buffer, " (%s:%d) ", (*it)->name.c_str(), (*it)->remotePort());
             line = " " + (*it)->nodeName() + buffer;
             line += "[" + (*it)->hostPlatform() + "] speed=";
@@ -1436,8 +1443,6 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                 }
             }
         }
-    } else if (cmd == "crashme") {
-        *(volatile int *)0 = 42;  // ;-)
     } else if (cmd == "internals") {
         for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
             Msg *msg = NULL;
@@ -1753,48 +1758,6 @@ static int open_tcp_listener(short port)
     return fd;
 }
 
-#define BROAD_BUFLEN 268
-#define BROAD_BUFLEN_OLD 16
-static int prepare_broadcast_reply(char* buf, const char* netname)
-{
-    if (buf[0] < 33) { // old client
-        buf[0]++;
-        memset(buf + 1, 0, BROAD_BUFLEN_OLD - 1);
-        snprintf(buf + 1, BROAD_BUFLEN_OLD - 1, "%s", netname);
-        buf[BROAD_BUFLEN_OLD - 1] = 0;
-        return BROAD_BUFLEN_OLD;
-    } else { // net client
-        buf[0] += 2;
-        memset(buf + 1, 0, BROAD_BUFLEN - 1);
-        uint32_t tmp_version = PROTOCOL_VERSION;
-        uint64_t tmp_time = starttime;
-        memcpy(buf + 1, &tmp_version, sizeof(uint32_t));
-        memcpy(buf + 1 + sizeof(uint32_t), &tmp_time, sizeof(uint64_t));
-        const int OFFSET = 1 + sizeof(uint32_t) + sizeof(uint64_t);
-        snprintf(buf + OFFSET, BROAD_BUFLEN - OFFSET, "%s", netname);
-        buf[BROAD_BUFLEN - 1] = 0;
-        return BROAD_BUFLEN;
-    }
-}
-
-static void broadcast_scheduler_version(const char* netname)
-{
-    const char length_netname = strlen(netname);
-    const int schedbuflen = 5 + sizeof(uint64_t) + length_netname;
-    char *buf = new char[ schedbuflen ];
-    buf[0] = 'I';
-    buf[1] = 'C';
-    buf[2] = 'E';
-    buf[3] = PROTOCOL_VERSION;
-    uint64_t tmp_time = starttime;
-    memcpy(buf + 4, &tmp_time, sizeof(uint64_t));
-    buf[4 + sizeof(uint64_t)] = length_netname;
-    strncpy(buf + 5 + sizeof(uint64_t), netname, length_netname);
-    DiscoverSched::broadcastData(scheduler_port, buf, schedbuflen);
-    delete[] buf;
-    buf = 0;
-}
-
 static void usage(const char *reason = 0)
 {
     if (reason) {
@@ -1824,7 +1787,7 @@ static void trigger_exit(int signum)
     } else {
         // hmm, we got killed already. try better
         static const char msg[] = "forced exit.\n";
-        write(STDERR_FILENO, msg, strlen( msg ));
+        ignore_result(write(STDERR_FILENO, msg, strlen( msg )));
         _exit(1);
     }
 
@@ -1836,26 +1799,26 @@ static void handle_scheduler_announce(const char* buf, const char* netname, bool
 {
     /* Another scheduler is announcing it's running, disconnect daemons if it has a better version
        or the same version but was started earlier. */
-    if (!persistent_clients){
-        uint64_t tmp_time;
-        memcpy(&tmp_time, buf + 4, sizeof(uint64_t));
-        time_t other_time = tmp_time;
-        const unsigned char other_scheduler_protocol = buf[3];
-        if (other_scheduler_protocol >= 36)
+    time_t other_time;
+    int other_protocol_version;
+    string other_netname;
+    Broadcasts::getSchedulerVersionData(buf, &other_protocol_version, &other_time, &other_netname);
+    trace() << "Received scheduler announcement from " << inet_ntoa(broad_addr.sin_addr)
+            << ":" << ntohs(broad_addr.sin_port)
+            << " (version " << int(other_protocol_version) << ", netname " << other_netname << ")" << endl;
+    if (other_protocol_version >= 36)
+    {
+        if (other_netname == netname)
         {
-            const unsigned char recv_netname_len = buf[4 + sizeof(uint64_t)];
-            string local_netname = netname;
-            string recv_netname = string(buf + 5 + sizeof(uint64_t), recv_netname_len);
-            if (recv_netname == local_netname)
+            if (other_protocol_version > PROTOCOL_VERSION || (other_protocol_version == PROTOCOL_VERSION && other_time < starttime))
             {
-                if (other_scheduler_protocol > PROTOCOL_VERSION || (other_scheduler_protocol == PROTOCOL_VERSION && other_time < starttime))
-                {
+                if (!persistent_clients){
+                    log_info() << "Scheduler from " << inet_ntoa(broad_addr.sin_addr)
+                        << ":" << ntohs(broad_addr.sin_port)
+                        << " (version " << int(other_protocol_version) << ") has announced itself as a preferred"
+                        " scheduler, disconnecting all connections." << endl;
                     if (!css.empty() || !monitors.empty())
                     {
-                        log_info() << "Scheduler from " << inet_ntoa(broad_addr.sin_addr)
-                            << ":" << ntohs(broad_addr.sin_port)
-                            << " (version " << int(other_scheduler_protocol) << ") has announced itself as a preferred"
-                            " scheduler, disconnecting all connections." << endl;
                         while (!css.empty())
                         {
                             handle_end(css.front(), NULL);
@@ -1876,7 +1839,7 @@ int main(int argc, char *argv[])
     int listen_fd, remote_fd, broad_fd, text_fd;
     struct sockaddr_in remote_addr;
     socklen_t remote_len;
-    char *netname = (char *)"ICECREAM";
+    const char *netname = "ICECREAM";
     bool detach = false;
     bool persistent_clients = false;
     int debug_level = Error;
@@ -1914,7 +1877,7 @@ int main(int argc, char *argv[])
             { 0, 0, 0, 0 }
         };
 
-        const int c = getopt_long(argc, argv, "n:p:hl:vdr:u:r:", long_options, &option_index);
+        const int c = getopt_long(argc, argv, "n:p:hl:vdru:", long_options, &option_index);
 
         if (c == -1) {
             break;    // eoo
@@ -1940,14 +1903,8 @@ int main(int argc, char *argv[])
             break;
         case 'v':
 
-            if (debug_level & Warning) {
-                if (debug_level & Info) { // for second call
-                    debug_level |= Debug;
-                } else {
-                    debug_level |= Info;
-                }
-            } else {
-                debug_level |= Warning;
+            if (debug_level < MaxVerboseLevel) {
+                debug_level++;
             }
 
             break;
@@ -2001,7 +1958,7 @@ int main(int argc, char *argv[])
     }
 
     if (warn_icecc_user_errno != 0) {
-        log_errno("Error: no icecc user on system. Falling back to nobody.", errno);
+        log_errno("No icecc user on system. Falling back to nobody.", errno);
     }
 
     if (getuid() == 0) {
@@ -2042,7 +1999,10 @@ int main(int argc, char *argv[])
     log_info() << "ICECREAM scheduler " VERSION " starting up, port " << scheduler_port << endl;
 
     if (detach) {
-        daemon(0, 0);
+        if (daemon(0, 0) != 0) {
+            log_errno("Failed to detach.", errno);
+            exit(1);
+        }
     }
 
     listen_fd = open_tcp_listener(scheduler_port);
@@ -2069,6 +2029,8 @@ int main(int argc, char *argv[])
     }
 
     starttime = time(0);
+    if( getenv( "ICECC_FAKE_STARTTIME" ) != NULL )
+        starttime -= 1000;
 
     ofstream pidFile;
     string progName = argv[0];
@@ -2082,9 +2044,11 @@ int main(int argc, char *argv[])
     signal(SIGINT, trigger_exit);
     signal(SIGALRM, trigger_exit);
 
+    log_info() << "scheduler ready" << endl;
+
     time_t next_listen = 0;
 
-    broadcast_scheduler_version(netname);
+    Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime);
     last_announce = starttime;
 
     while (!exit_main_loop) {
@@ -2100,7 +2064,7 @@ int main(int argc, char *argv[])
            their daemons if we are the preferred scheduler (daemons with version new enough
            should automatically select the best scheduler, but old daemons connect randomly). */
         if (last_announce + 120 < time(NULL)) {
-            broadcast_scheduler_version(netname);
+            Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime);
             last_announce = time(NULL);
         }
 
@@ -2165,19 +2129,21 @@ int main(int argc, char *argv[])
             }
         }
 
-        max_fd = select(max_fd + 1, &read_set, &write_set, NULL, &tv);
+        int active_fds = select(max_fd + 1, &read_set, &write_set, NULL, &tv);
 
-        if (max_fd < 0 && errno == EINTR) {
+        if (active_fds < 0 && errno == EINTR) {
+            reset_debug_if_needed(); // we possibly got SIGHUP
             continue;
         }
+        reset_debug_if_needed();
 
-        if (max_fd < 0) {
+        if (active_fds < 0) {
             log_perror("select()");
             return 1;
         }
 
         if (FD_ISSET(listen_fd, &read_set)) {
-            max_fd--;
+            active_fds--;
             bool pending_connections = true;
 
             while (pending_connections) {
@@ -2220,8 +2186,8 @@ int main(int argc, char *argv[])
             next_listen = time(0) + 1;
         }
 
-        if (max_fd && FD_ISSET(text_fd, &read_set)) {
-            max_fd--;
+        if (active_fds && FD_ISSET(text_fd, &read_set)) {
+            active_fds--;
             remote_len = sizeof(remote_addr);
             remote_fd = accept(text_fd,
                                (struct sockaddr *) &remote_addr,
@@ -2249,20 +2215,17 @@ int main(int argc, char *argv[])
             }
         }
 
-        if (max_fd && FD_ISSET(broad_fd, &read_set)) {
-            max_fd--;
-            char buf[BROAD_BUFLEN + 1];
+        if (active_fds && FD_ISSET(broad_fd, &read_set)) {
+            active_fds--;
+            char buf[Broadcasts::BROAD_BUFLEN + 1];
             struct sockaddr_in broad_addr;
             socklen_t broad_len = sizeof(broad_addr);
             /* We can get either a daemon request for a scheduler (1 byte) or another scheduler
                announcing itself (4 bytes + time). */
 
-            int schedbuflen = 4 + sizeof(uint64_t);
-
-            int buflen = recvfrom(broad_fd, buf, BROAD_BUFLEN, 0, (struct sockaddr *) &broad_addr,
+            int buflen = recvfrom(broad_fd, buf, Broadcasts::BROAD_BUFLEN, 0, (struct sockaddr *) &broad_addr,
                     &broad_len);
-            /* Daemon is searching for a scheduler, only answer if daemon would be able to talk to us. */
-            if (buflen < 0 || buflen > BROAD_BUFLEN){
+            if (buflen < 0 || buflen > Broadcasts::BROAD_BUFLEN){
                 int err = errno;
                 log_perror("recvfrom()");
 
@@ -2275,42 +2238,27 @@ int main(int argc, char *argv[])
                     return -1;
                 }
             }
-            if (buflen == 1) {
-                if (buf[0] >= MIN_PROTOCOL_VERSION){
+            int daemon_version;
+            if (DiscoverSched::isSchedulerDiscovery(buf, buflen, &daemon_version)) {
+                /* Daemon is searching for a scheduler, only answer if daemon would be able to talk to us. */
+                if ( daemon_version >= MIN_PROTOCOL_VERSION){
                     log_info() << "broadcast from " << inet_ntoa(broad_addr.sin_addr)
                         << ":" << ntohs(broad_addr.sin_port)
-                        << " (version " << int(buf[0]) << ")\n";
-                    int reply_len = prepare_broadcast_reply(buf, netname);
+                        << " (version " << daemon_version << ")\n";
+                    int reply_len = DiscoverSched::prepareBroadcastReply(buf, netname, starttime);
                     if (sendto(broad_fd, buf, reply_len, 0,
                                 (struct sockaddr *) &broad_addr, broad_len) != reply_len) {
                         log_perror("sendto()");
                     }
                 }
             }
-            else if(buflen >= schedbuflen && buf[0] == 'I' && buf[1] == 'C' && buf[2] == 'E') {
-                if(buf[3] > 35)
-                {
-                    schedbuflen += 1 + buf[schedbuflen];
-                }
-                if (buflen != schedbuflen){
-                    int err = errno;
-                    log_perror("recvfrom()");
-
-                    /* Some linux 2.6 kernels can return from select with
-                       data available, and then return from read() with EAGAIN
-                       even on a blocking socket (breaking POSIX).  Happens
-                       when the arriving packet has a wrong checksum.  So
-                       we ignore EAGAIN here, but still abort for all other errors. */
-                    if (err != EAGAIN) {
-                        return -1;
-                    }
-                }
+            else if(Broadcasts::isSchedulerVersion(buf, buflen)) {
                 handle_scheduler_announce(buf, netname, persistent_clients, broad_addr);
             }
         }
 
         for (map<int, CompileServer *>::const_iterator it = fd2cs.begin();
-                max_fd && it != fd2cs.end();) {
+                active_fds > 0 && it != fd2cs.end();) {
             int i = it->first;
             CompileServer *cs = it->second;
             /* handle_activity can delete the channel from the fd2cs list,
@@ -2325,20 +2273,23 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                max_fd--;
+                active_fds--;
             }
         }
 
         for (list<CompileServer *>::const_iterator it = cs_in_tsts.begin();
                 it != cs_in_tsts.end(); ++it) {
+            if(find(css.begin(), css.end(), *it) == css.end()) {
+                continue; // deleted meanwhile
+            }
             if((*it)->getConnectionInProgress())
             {
-                if(max_fd && (FD_ISSET((*it)->getInFd(), &read_set) || FD_ISSET((*it)->getInFd(), &write_set)) && (*it)->isConnected())
+                if(active_fds > 0 && (FD_ISSET((*it)->getInFd(), &read_set) || FD_ISSET((*it)->getInFd(), &write_set)) && (*it)->isConnected())
                 {
-                    max_fd--;
+                    active_fds--;
                     (*it)->updateInConnectivity(true);
                 }
-                else if((!max_fd || (FD_ISSET((*it)->getInFd(), &read_set) || FD_ISSET((*it)->getInFd(), &write_set))) && !(*it)->isConnected())
+                else if((active_fds == 0 || (FD_ISSET((*it)->getInFd(), &read_set) || FD_ISSET((*it)->getInFd(), &write_set))) && !(*it)->isConnected())
                 {
                     (*it)->updateInConnectivity(false);
                 }
@@ -2354,7 +2305,7 @@ int main(int argc, char *argv[])
     if ((-1 == close(broad_fd)) && (errno != EBADF)){
         log_perror("close failed");
     }
-    if (-1 == unlink(pidFilePath.c_str())){
+    if (-1 == unlink(pidFilePath.c_str()) && errno != ENOENT){
         log_perror("unlink failed") << "\t" << pidFilePath << endl;
     }
     return 0;

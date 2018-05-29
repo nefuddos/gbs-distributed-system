@@ -94,7 +94,7 @@ error_client(MsgChannel *client, string error)
 
 int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileResultMsg &rmsg,
             const std::string &tmp_root, const std::string &build_path, const std::string &file_name,
-            unsigned long int mem_limit, int client_fd, int /*job_in_fd*/)
+            unsigned long int mem_limit, int client_fd)
 {
     rmsg.out.erase(rmsg.out.begin(), rmsg.out.end());
     rmsg.out.erase(rmsg.out.begin(), rmsg.out.end());
@@ -105,6 +105,16 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
     if (j.dwarfFissionEnabled()) {
         list.push_back("-gsplit-dwarf");
     }
+
+    trace() << "remote compile for file " << j.inputFile() << endl;
+
+    string argstxt;
+    for (std::list<string>::const_iterator it = list.begin();
+         it != list.end(); ++it) {
+        argstxt += ' ';
+        argstxt += *it;
+    }
+    trace() << "remote compile arguments:" << argstxt << endl;
 
     int sock_err[2];
     int sock_out[2];
@@ -179,21 +189,36 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         }
 
 #ifdef RLIMIT_AS
+
+// Sanitizers use huge amounts of virtual memory and the setrlimit() call below
+// may lead to the process getting killed at any moment without any warning
+// or message. Both gcc's and clang's macros are unreliable (no way to detect -fsanitize=leak,
+// for example), but hopefully with the configure check this is good enough.
+#ifndef SANITIZER_USED
+#ifdef __SANITIZE_ADDRESS__
+#define SANITIZER_USED
+#endif
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SANITIZER_USED
+#endif
+#endif
+#endif
+
+#ifndef SANITIZER_USED
         struct rlimit rlim;
 
-        if (getrlimit(RLIMIT_AS, &rlim)) {
-            error_client(client, "getrlimit failed.");
-            log_perror("getrlimit");
-        }
-
-        rlim.rlim_cur = mem_limit * 1024 * 1024;
-        rlim.rlim_max = mem_limit * 1024 * 1024;
+        rlim_t lim = mem_limit * 1024 * 1024;
+        rlim.rlim_cur = lim;
+        rlim.rlim_max = lim;
 
         if (setrlimit(RLIMIT_AS, &rlim)) {
             error_client(client, "setrlimit failed.");
             log_perror("setrlimit");
+        } else {
+            log_info() << "Compile job memory limit set to " << mem_limit << " megabytes" << endl;
         }
-
+#endif
 #endif
 
         int argc = list.size();
@@ -221,7 +246,18 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         }
 
         argv[i++] = strdup("-x");
-        argv[i++] = strdup((j.language() == CompileJob::Lang_CXX) ? "c++" : "c");
+        if (j.language() == CompileJob::Lang_C) {
+          argv[i++] = strdup("c");
+        } else if (j.language() == CompileJob::Lang_CXX) {
+          argv[i++] = strdup("c++");
+        } else if (j.language() == CompileJob::Lang_OBJC) {
+          argv[i++] = strdup("objective-c");
+        } else if (j.language() == CompileJob::Lang_OBJCXX) {
+          argv[i++] = strdup("objective-c++");
+        } else {
+            error_client(client, "language not supported");
+            log_perror("language not supported");
+        }
 
         if( clang ) {
             // gcc seems to handle setting main file name and working directory fine
@@ -290,6 +326,15 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         argv[i] = 0;
         assert(i <= argc);
 
+        argstxt.clear();
+        for (int pos = 1;
+             pos < i;
+             ++pos ) {
+            argstxt += ' ';
+            argstxt += argv[pos];
+        }
+        trace() << "final arguments:" << argstxt << endl;
+
         close_debug();
 
         if ((-1 == close(sock_out[0])) && (errno != EBADF)){
@@ -344,8 +389,8 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
 #ifdef ICECC_DEBUG
 
         for (int f = STDERR_FILENO + 1; f < 4096; ++f) {
-            long flags;
-            assert((flags = fcntl(f, F_GETFD, 0)) < 0 || (flags & FD_CLOEXEC));
+            long flags = fcntl(f, F_GETFD, 0);
+            assert(flags < 0 || (flags & FD_CLOEXEC));
         }
 
 #endif
@@ -441,6 +486,7 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                         job_stat[JobStatistics::in_compressed] += fcmsg->compressed;
                     } else {
                         log_error() << "protocol error while reading preprocessed file" << endl;
+                        input_complete = true;
                         return_value = EXIT_IO_ERROR;
                         client_fd = -1;
                         kill(pid, SIGTERM);
@@ -451,6 +497,7 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                 }
             } else if (client->at_eof()) {
                 log_error() << "unexpected EOF while reading preprocessed file" << endl;
+                input_complete = true;
                 return_value = EXIT_IO_ERROR;
                 client_fd = -1;
                 kill(pid, SIGTERM);
@@ -579,9 +626,6 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                     continue;
                 }
 
-                // The fd is -1 anyway
-                //write(job_in_fd, fcmsg->buffer + off, bytes);
-
                 off += bytes;
 
                 if (off == fcmsg->len) {
@@ -645,11 +689,15 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
 
                     if (((mem_used * 100) > (85 * mem_limit * 1024))
                             || (rmsg.err.find("memory exhausted") != string::npos)
-                            || (rmsg.err.find("out of memory allocating") != string::npos)
+                            || (rmsg.err.find("out of memory") != string::npos)
                             || (rmsg.err.find("annot allocate memory") != string::npos)
+                            || (rmsg.err.find("failed to map segment from shared object") != string::npos)
+                            || (rmsg.err.find("Assertion `NewElts && \"Out of memory\"' failed") != string::npos)
                             || (rmsg.err.find("terminate called after throwing an instance of 'std::bad_alloc'") != string::npos)
                             || (rmsg.err.find("llvm::MallocSlabAllocator::Allocate") != string::npos)) {
                         // the relation between ulimit and memory used is pretty thin ;(
+                        log_warning() << "Remote compilation failed, presumably because of running out of memory (exit code "
+                            << shell_exit_status(status) << ")" << endl;
                         return EXIT_OUT_OF_MEMORY;
                     }
                 }
@@ -667,6 +715,13 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                     job_stat[JobStatistics::sys_msec] = (ru.ru_stime.tv_sec * 1000)
                                                         + (ru.ru_stime.tv_usec / 1000);
                     job_stat[JobStatistics::sys_pfaults] = ru.ru_majflt + ru.ru_nswap + ru.ru_minflt;
+                    if(rmsg.status != 0) {
+                        log_warning() << "Remote compilation exited with exit code " << shell_exit_status(status) << endl;
+                    } else {
+                        log_info() << "Remote compilation completed with exit code " << shell_exit_status(status) << endl;
+                    }
+                } else {
+                    log_warning() << "Remote compilation aborted with exit code " << shell_exit_status(status) << endl;
                 }
 
                 return return_value;

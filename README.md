@@ -1,5 +1,6 @@
 [![Stories in Ready](https://badge.waffle.io/icecc/icecream.png?label=ready&title=Ready)](https://waffle.io/icecc/icecream)
 [![Build Status](https://travis-ci.org/icecc/icecream.svg?branch=master)](https://travis-ci.org/icecc/icecream)
+[![Codacy Badge](https://api.codacy.com/project/badge/Grade/d0fd9ba53b424b37964340970392eec2)](https://www.codacy.com/app/icecc/icecream?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=icecc/icecream&amp;utm_campaign=Badge_Grade)
 
 [Icecream](Icecream) was created by SUSE based on distcc. Like distcc,
 [Icecream](Icecream) takes compile jobs from a build and
@@ -21,7 +22,7 @@ Table of Contents
     -   [osc build](#osc-build)
     -   [some compilation node aren't
         used](#some-compilation-node-arent-used)
-    -   [build with -Werror fails when using icecream ](#build-with--werror-fails-when-using-icecream)
+    -   [build with -Werror fails only when using icecream ](#build-with--werror-fails-only-when-using-icecream)
     -   [clang 4.0 tries to read /proc/cpuinfo and fails](#clang-tries-to-read-proccpuinfo-and-fails)
 
 -   [Supported platforms](#supported-platforms)
@@ -52,11 +53,11 @@ Table of Contents
 Installation
 -------------------------------------------------------------------------
 
-We recomend that you use packages maintained by your distribution if possible.
+We recommend that you use packages maintained by your distribution if possible.
 Your distribution should provide customized startup scripts that make icecream
 fit better into the way your system is configured.
 
-We highly recomend you install [icemon](https://github.com/icecc/icemon) with
+We highly recommend you install [icemon](https://github.com/icecc/icemon) with
 icecream.
 
 If you want to install from source see the instructions in the README file 
@@ -110,8 +111,7 @@ simple configuration change)
 
 ### make scheduler persistent:
 
-By adding an option --scheduler-host for daemon and --persistent-client-connection for scheduler
-,the client connections are not disconnected from the scheduler even there is an availability of better scheduler.
+By adding an option --scheduler-host for daemon and --persistent-client-connection for scheduler, the client connections are not disconnected from the scheduler even there is an availability of better scheduler.
 
 TroubleShooting
 -------------------------------------------------------------------------------
@@ -177,45 +177,15 @@ being used at all for compilation, check you have the same icecream
 version on all nodes, otherwise, nodes running older icecream version
 might be excluded from available nodes.
 
-The icecream version shipped with openSUSE 12.2 is partially incompatible
-with nodes using other icecream versions. 12.2 nodes will not be used for compilation
-by other nodes, and depending on the scheduler version 12.2 nodes will not compile
-on other nodes either. These incompatible nodes can be identified by having 
-'Linux3_' prefix in the platform). Replace the openSUSE 12.2 package
-with a different one (for example from the devel:tools:build repository).
+### build with -Werror fails only when using icecream
 
-### build with -Werror fails when using icecream
-
-This happens with gcc when `-Werror` is used and preprocessor generates code that issues
-warning. For example this code (taken from ltrace project):
-
-    assert(info->type != info->type);
-
-When building locally, gcc performs preprocessing and compilation in one step
-and ignores this warning (see gcc
-[bugzilla](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80369)). But icecream splits 
-preprocessing (done locally) and compilation (done remotely), which makes gcc trigger 
-a warning message and compilation fails (because of `-Werror`).
-   
-There is no known workaround, either disable `-Werror` or fix the code.
+This problem should not exist with a recent icecream version. If it does, try
+using `ICECC_REMOTE_CPP=1` (see `icecc --help`).
 
 ### clang tries to read /proc/cpuinfo and fails
 
-This is a bug in clang 4.0. https://bugs.llvm.org/show_bug.cgi?id=33008 
-It should be fixed in the future, but if you have a broken release you can work around this by
-creating a custom environment and adding /proc/cpuinfo to it.
-
-```
-/usr/lib/icecc/icecc-create-env --clang /usr/bin/clang /usr/lib/icecc/compilerwrapper --addfile /proc/cpuinfo
-```
-
-Do not apply this work around if you do not need it. /proc/cpuinfo is machine specific so and this work 
-around will place wrong infomation in it. In the case of the bug in clang 4.0 this file is checked for 
-existance but the contents are not actually used, but it is possible future versions of clang/gcc will use
-this file if it exists for something else.
-
-see [Using icecream in heterogeneous environments](#using-icecream-in-heterogeneous-environments) 
-for more information on using icecc-create-env.
+This is a problem of clang 4.0 and newer: https://bugs.llvm.org/show_bug.cgi?id=33008 
+The most recent Icecream version works around this problem.
 
 Supported platforms
 ---------------------------------------------------------------------------------------
@@ -231,6 +201,11 @@ tricky parts. Supported are:
 
 Note that all these platforms can be used both as server and as client -
 meaning you can do full cross compiling between them.
+
+The following platforms are known to work at least as a client, meaning that
+you can run compilation on them that will compile on remote nodes using cross compilation.
+
+      - Cygwin
 
 Using icecream in heterogeneous environments
 -----------------------------------------------------------------------------------------------------------------------------------------
@@ -366,14 +341,11 @@ for the same host architecture:
     in the $PATH and before the path of the toolchains.
 
 -   Create a tarball file for each toolchain that you want to use with
-    icecream. The /usr/lib/icecc/icecc-create-env script can be used to
+    icecream. icecc-create-env script can be used to
     create the tarball file for each toolchain, for example:
 
-    /usr/lib/icecc/icecc-create-env --gcc /work/toolchain1/bin/arm-eabi-gcc
-                                          /work/toolchain1/bin/arm-eabi-g++
-
-    /usr/lib/icecc/icecc-create-env --gcc /work/toolchain2/bin/arm-linux-androideabi-gcc
-                                          /work/toolchain2/bin/arm-linux-androideabi-gcc
+    icecc-create-env /work/toolchain1/bin/arm-eabi-gcc
+    icecc-create-env /work/toolchain2/bin/arm-linux-androideabi-gcc
 
 -   Set ICECC\_VERSION to point to the native tarball file and for each
     tarball file created to the toolchains (e.g  ICECC\_VERSION=/work/i386-native.tar.gz,/work/arm-eabi-toolchain1.tar.gz=arm-eabi,/work/arm-linux-androideabi-toolchain2.tar.gz=arm-linux-androideabi).
@@ -487,41 +459,56 @@ and two quick to compile and one long to compile source file, you're not
 safe from a choice where everyone has to wait on the slow machine. Keep
 that in mind.
 
+Icecream is very sensitive to latency between nodes, and packet loss. While
+icecream has been successfully used by people who are on opposite sides of the
+earth, when those users were isolated to their geographic location the speed
+improved for everyone. In most corporate environments within a single building
+everything works well, but between two buildings often is troublesome.
+
 Some advice on configuration
 -----------------------------------------------------------------------------------------------------------------------------------
 
-Icecream supports many configurations but you need to understand your network
-to choose what is right for you. 
+Icecream supports many configurations but you need to understand your network to
+choose what is right for you. 
 
-The easiest is to designate one machine always on machine to be a server and 
-start the clients. This is the best environment for conferences where users are 
-using mixed versions of icecream and will not be together for long. icecream 
-will automatically find the scheduler. This is also the best setup if you have
-any machine that might run versions of icecream less than 1.1. The downside of
-this setup is the scheduler must be a machine that is always on.
+You should ensure that the scheduler up to the latest version. Many new features
+require the client and scheduler work together to use them. Even though clients
+should work with old schedulers new features will not work, and may not be disabled
+correctly.
 
-If everyone is running 1.1 or latter you may choose to have everyone run
-a scheduler. The icecream schedulers will choose one to be the master and
-everyone will connect to it. If the scheduler machine goes down a new master
-will be selected. This is a new feature that is somewhat experimental, but if
-it works it likely the most reliable. If anyone on your network is running
-versions earlier than 1.1 they will have problems with this configuration.
+Version 1.1 gained the ability for multiple schedulers on a single network to
+decide on the best master. However daemons running earlier versions do not understand
+this, and it is random if they will find the correct one. In all other ways it is
+believed that mixing old and new versions of the daemon will work: if you use a new
+feature only new clients will be used.
 
-You may also designate a scheduler machine, and then for each client specify
-the scheduler to use. You need to ensure that there is no other scheduler on
-the same network as the scheduler if you do this. This is useful if you have
-developers scattered around the office but only a few are on any given network
-sub-net. If you do this check with IT to ensure that icecream traffic won't
-overload routers. It is safe to mix icecream versions less than 1.1 with 1.1
-on this setup.
+Recommended is to start the scheduler and daemon on every body's machine. The
+icecream schedulers will choose one to be the master and everyone will connect
+to it. When the scheduler machine goes down a new master will be selected automatically.
+
+If you need to run mixed icecream versions, then it is best to designate one
+machine on each subnet to be a scheduler. Icecream nodes will automatically find
+the scheduler and connect to it. If someone accidentally starts a second
+scheduler this will cause problems with clients that are less than 1.1, but they
+should eventually work. The scheduler should be a reliable machine, but if it
+fails you use any existing machine as a replacement.
+
+You may also designate a scheduler machine, and then for each client specify the
+scheduler to use (this is a variation of the previous case). You need to ensure
+that there is no other schedulers on the same network as this scheduler if you
+do this. The scheduler machine MUST be reliable, any failure will require
+reconfiguring all client machines. This setup allows you to specify one
+scheduler per building which is useful if single developers are scattered
+around. If you do this check with IT to ensure that icecream traffic won't
+overload routers.
 
 You might designate a netname. This is useful if your network is using VPN to
 make it seem like developers who are physically a long distance apart seem like
 they are on the same sub-net. While the VPNs are useful, they are typically do
 not have enough bandwidth for icecream, so by setting a different netname on
-each side of the VPN you can save bandwidth. Netnames can be used to work
-around some limitations above: if a netname is set icecream schedulers and
-daemons will ignore the existence scheudlers and daemons with any other netname.
+each side of the VPN you can save bandwidth. Netnames can be used to work around
+some limitations above: if a netname is set icecream schedulers and daemons will
+ignore the existence of other schedulers and daemons.
 
 
 Network setup for Icecream (firewalls)
@@ -562,12 +549,12 @@ Icecream on gentoo
 -------------------------------------------------------------------------------------
 
 -   It is recommended to remove all processor specific optimizations
-    from the CFLAGS line in /etc/make.conf. On the aKademy cluster it
+    from the CFLAGS line in /etc/portage/make.conf. On the aKademy cluster it
     proved useful to use only "-O2", otherwise there are often internal
     compiler errors, if not all computers have the same processor
     type/version
 
-**Be aware** that you have to change the CFLAGS during ich gcc update
+**Be aware** that you have to change the CFLAGS during each gcc update
 too.
 
 -   To use icecream with emerge/ebuild use PREROOTPATH=/opt/icecream/lib/icecc/bin

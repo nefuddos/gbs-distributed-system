@@ -26,28 +26,72 @@
 #include <fstream>
 #include <signal.h>
 #include <limits.h>
+#include <fcntl.h>
 #ifdef __linux__
 #include <dlfcn.h>
 #endif
 
 using namespace std;
 
-int debug_level = 0;
+int debug_level = Error;
 ostream *logfile_trace = 0;
 ostream *logfile_info = 0;
 ostream *logfile_warning = 0;
 ostream *logfile_error = 0;
 string logfile_prefix;
+volatile sig_atomic_t reset_debug_needed = 0;
 
 static ofstream logfile_null("/dev/null");
 static ofstream logfile_file;
 static string logfile_filename;
 
-void reset_debug(int);
+static void reset_debug_signal_handler(int);
+
+// Implementation of an iostream helper that allows redirecting output to a given file descriptor.
+// This seems to be the only portable way to do it.
+namespace
+{
+class ofdbuf : public streambuf
+{
+public:
+    explicit ofdbuf( int fd ) : fd( fd ) {}
+    virtual int_type overflow( int_type c );
+    virtual streamsize xsputn( const char* c, streamsize n );
+private:
+    int fd;
+};
+
+ofdbuf::int_type ofdbuf::overflow( int_type c )
+{
+    if( c != EOF ) {
+        char cc = c;
+        if( write( fd, &cc, 1 ) != 1 )
+            return EOF;
+    }
+    return c;
+}
+
+streamsize ofdbuf::xsputn( const char* c, streamsize n )
+{
+    return write( fd, c, n );
+}
+
+ostream* ccache_stream( int fd )
+{
+    int status = fcntl( fd, F_GETFL );
+    if( status < 0 || ( status & ( O_WRONLY | O_RDWR )) == 0 ) {
+        // As logging is not set up yet, this will log to stderr.
+        log_warning() << "UNCACHED_ERR_FD provides an invalid file descriptor, using stderr" << endl;
+        return &cerr; // fd is not valid fd for writting
+    }
+    static ofdbuf buf( fd );
+    static ostream stream( &buf );
+    return &stream;
+}
+} // namespace
 
 void setup_debug(int level, const string &filename, const string &prefix)
 {
-    string fname = filename;
     debug_level = level;
     logfile_prefix = prefix;
     logfile_filename = filename;
@@ -63,6 +107,7 @@ void setup_debug(int level, const string &filename, const string &prefix)
         logfile_file.open(filename.c_str(), fstream::out | fstream::app);
 #ifdef __linux__
 
+        string fname = filename;
         if (fname[0] != '/') {
             char buf[PATH_MAX];
 
@@ -75,6 +120,8 @@ void setup_debug(int level, const string &filename, const string &prefix)
         setenv("SEGFAULT_OUTPUT_NAME", fname.c_str(), false);
 #endif
         output = &logfile_file;
+    } else if( const char* ccache_err_fd = getenv( "UNCACHED_ERR_FD" )) {
+        output = ccache_stream( atoi( ccache_err_fd ));
     } else {
         output = &cerr;
     }
@@ -83,36 +130,71 @@ void setup_debug(int level, const string &filename, const string &prefix)
     (void) dlopen("libSegFault.so", RTLD_NOW | RTLD_LOCAL);
 #endif
 
-    if (debug_level & Debug) {
+    if (debug_level >= Debug) {
         logfile_trace = output;
     } else {
         logfile_trace = &logfile_null;
     }
 
-    if (debug_level & Info) {
+    if (debug_level >= Info) {
         logfile_info = output;
     } else {
         logfile_info = &logfile_null;
     }
 
-    if (debug_level & Warning) {
+    if (debug_level >= Warning) {
         logfile_warning = output;
     } else {
         logfile_warning = &logfile_null;
     }
 
-    if (debug_level & Error) {
+    if (debug_level >= Error) {
         logfile_error = output;
     } else {
         logfile_error = &logfile_null;
     }
 
-    signal(SIGHUP, reset_debug);
+    signal(SIGHUP, reset_debug_signal_handler);
 }
 
-void reset_debug(int)
+void reset_debug()
 {
     setup_debug(debug_level, logfile_filename);
+}
+
+void reset_debug_signal_handler(int)
+{
+    reset_debug_needed = 1;
+}
+
+void reset_debug_if_needed()
+{
+    if( reset_debug_needed ) {
+        reset_debug_needed = 0;
+        reset_debug();
+        if( const char* env = getenv( "ICECC_TEST_FLUSH_LOG_MARK" )) {
+            ifstream markfile( env );
+            string mark;
+            getline( markfile, mark );
+            if( !mark.empty()) {
+                assert( logfile_trace != NULL );
+                *logfile_trace << "flush log mark: " << mark << endl;
+            }
+        }
+        if( const char* env = getenv( "ICECC_TEST_LOG_HEADER" )) {
+            ifstream markfile( env );
+            string header1, header2, header3;
+            getline( markfile, header1 );
+            getline( markfile, header2 );
+            getline( markfile, header3 );
+            if( !header1.empty()) {
+                assert( logfile_trace != NULL );
+                *logfile_trace << header1 << endl;
+                *logfile_trace << header2 << endl;
+                *logfile_trace << header3 << endl;
+            }
+        }
+    }
 }
 
 void close_debug()

@@ -1,8 +1,11 @@
 /* -*- mode: C++; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 99; -*- */
 /* vim: set ts=4 sw=4 et tw=99:  */
 /*
- * distcc -- A simple distributed compiler system
+ * icecc -- A simple distributed compiler system
  *
+ * Copyright (C) 2003, 2004 by the Icecream Authors
+ *
+ * based on distcc
  * Copyright (C) 2002, 2003 by Martin Pool <mbp@samba.org>
  *
  * This program is free software; you can redistribute it and/or modify
@@ -20,24 +23,14 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
-#include <string>
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
-class CompileJob;
+void expandargv (int *argcp, char ***argvp);
+void freeargv(char **vector);
 
-/* util.c */
-extern int set_cloexec_flag(int desc, int value);
-extern int dcc_ignore_sigpipe(int val);
-
-extern std::string find_basename(const std::string &sfile);
-extern std::string find_prefix(const std::string &basename);
-extern void colorify_output(const std::string &s_ccout);
-extern bool colorify_wanted(const CompileJob &job);
-extern bool compiler_has_color_output(const CompileJob &job);
-extern bool output_needs_workaround(const CompileJob &job);
-extern bool ignore_unverified();
-extern int resolve_link(const std::string &file, std::string &resolved);
-extern std::string get_cwd();
-extern std::string read_command_output(const std::string& command);
-
-extern bool dcc_unlock(int lock_fd);
-extern bool dcc_lock_host(int &lock_fd);
+#ifdef __cplusplus
+}
+#endif

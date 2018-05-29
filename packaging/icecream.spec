@@ -117,6 +117,7 @@ rm -rf ${RPM_BUILD_ROOT}
 #%config /etc/init.d/icecream
 %_bindir/icecc
 %_bindir/icecc-create-env
+%_bindir/icecc-test-env
 %_bindir/icerun
 %_sbindir/icecc-scheduler
 #%_libdir/icecc

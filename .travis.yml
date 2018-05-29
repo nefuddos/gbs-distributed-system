@@ -1,0 +1,104 @@
+language: cpp
+
+script:
+  - ./autogen.sh
+  - ./configure --prefix=$PWD/_inst
+  - make
+  - |
+        if test "$TRAVIS_OS_NAME" = "linux"; then
+            strict="-strict"
+            if test -n "$VALGRIND"; then
+                # See tests/README.
+                sudo /sbin/setcap cap_sys_chroot+ep /usr/lib/valgrind/memcheck-amd64-linux
+            fi
+            make test${strict} VALGRIND=$VALGRIND TESTCC=/usr/bin/gcc TESTCXX=/usr/bin/g++
+            if test $? -ne 0; then
+                exit 1
+            fi
+            # Only the clang(-3.4) package provides /usr/bin/clang, but this path is hardcoded in icecream.
+            # So for now make icecream use the newer version provided by Travis.
+            sudo ln -s `which clang` /usr/bin/clang
+            sudo ln -s `which clang++` /usr/bin/clang++
+            make test${strict} VALGRIND=$VALGRIND TESTCC=/usr/bin/clang TESTCXX=/usr/bin/clang++
+        elif test "$TRAVIS_OS_NAME" = "osx"; then
+            if test -n "$STRICTTESTS"; then
+                strict="-strict"
+            fi
+            make test${strict} TESTCC=clang TESTCXX=clang++
+        fi
+
+matrix:
+  include:
+  - os: linux
+    sudo: true # for setcap so we can run the tests in chroot.
+    compiler: gcc
+    dist: trusty
+  - os: linux
+    sudo: true # for setcap so we can run the tests in chroot.
+    compiler: clang
+    dist: trusty
+  - os: osx
+    before_install:
+      - brew update
+      - brew install lzo docbook2x gdb ccache
+  - os: linux
+    sudo: true # for setcap so we can run the tests in chroot.
+    compiler: clang
+    env: VALGRIND=1
+    dist: trusty
+  - os: linux
+    sudo: true # for setcap so we can run the tests in chroot.
+    compiler: clang
+    env: BUILD_TYPE=asan
+    dist: trusty
+    # Sanitizer builds with newer travis fail for unknown reason without giving any message.
+    group: deprecated-2017Q4
+  - os: linux
+    sudo: true # for setcap so we can run the tests in chroot.
+    compiler: clang
+    env: BUILD_TYPE=lsan
+    dist: trusty
+    group: deprecated-2017Q4
+  - os: linux
+    sudo: true # for setcap so we can run the tests in chroot.
+    compiler: clang
+    env: BUILD_TYPE=ubsan
+    dist: trusty
+  allow_failures:
+
+before_script:
+  - |
+     if [ "$BUILD_TYPE" == "asan" ]; then
+         export SAN_FLAGS="-fsanitize=address -fsanitize-address-use-after-scope -fno-omit-frame-pointer"
+     fi
+  - |
+     if [ "$BUILD_TYPE" == "lsan" ]; then
+         export SAN_FLAGS="-fsanitize=leak -fno-omit-frame-pointer"
+     fi
+  - |
+     if [ "$BUILD_TYPE" == "msan" ]; then
+         export SAN_FLAGS="-fsanitize=memory-fno-omit-frame-pointer"
+     fi
+  - |
+     if [ "$BUILD_TYPE" == "ubsan" ]; then
+         export SAN_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer"
+         export LDFLAGS="$UBSAN_FLAGS ${LDFLAGS}"
+         export UBSAN_OPTIONS=print_stacktrace=1
+     fi
+  - |
+      export CFLAGS="${SAN_FLAGS} ${CFLAGS} -Wall -Wextra"
+      export CXXFLAGS="${SAN_FLAGS} ${CXXFLAGS} -Wall -Wextra"
+      export LDFLAGS="${SAN_FLAGS} ${LDFLAGS}"
+
+
+addons:
+  apt:
+    packages:
+    - gcc
+    - libcap-ng-dev
+    - libcap-ng-utils
+    - liblzo2-dev
+    - docbook2x
+    - realpath
+    - gdb
+    - valgrind

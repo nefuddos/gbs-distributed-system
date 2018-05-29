@@ -32,11 +32,14 @@
 #include <cassert>
 #include <cstring>
 
-enum DebugLevels {
-    Info = 1,
-    Warning = 2,
-    Error = 4,
-    Debug = 8
+// Verbosity level, from least to most.
+enum VerbosityLevel {
+    Error   = 0,
+    Warning = 1,
+    Info    = 2,
+    Debug   = 3,
+
+    MaxVerboseLevel = Debug
 };
 
 extern std::ostream *logfile_info;
@@ -46,7 +49,8 @@ extern std::ostream *logfile_trace;
 extern std::string logfile_prefix;
 
 void setup_debug(int level, const std::string &logfile = "", const std::string &prefix = "");
-void reset_debug(int);
+void reset_debug_if_needed(); // if we get SIGHUP, this will handle the reset
+void reset_debug();
 void close_debug();
 void flush_debug();
 
@@ -106,7 +110,7 @@ static inline std::ostream &trace()
 
 static inline std::ostream & log_errno(const char *prefix, int tmp_errno)
 {
-    return log_error() << prefix << " " << strerror(tmp_errno) << std::endl;
+    return log_error() << prefix << "(Error: " << strerror(tmp_errno) << ")" << std::endl;
 }
 
 static inline std::ostream & log_perror(const char *prefix)

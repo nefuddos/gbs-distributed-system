@@ -37,12 +37,11 @@ using namespace std;
  **/
 
 static const char dcc_safeguard_name[] = "_ICECC_SAFEGUARD";
-static char dcc_safeguard_set[] = "_ICECC_SAFEGUARD=1";
 static int dcc_safeguard_level;
 
 int dcc_recursion_safeguard(void)
 {
-    char *env = getenv(dcc_safeguard_name);
+    const char *env = getenv(dcc_safeguard_name);
 
     if (env) {
         //trace() << "safeguard: " << env << endl;
@@ -61,12 +60,9 @@ int dcc_recursion_safeguard(void)
 
 void dcc_increment_safeguard(void)
 {
-    if (dcc_safeguard_level > 0) {
-        dcc_safeguard_set[sizeof dcc_safeguard_set - 2] = dcc_safeguard_level + '1';
-    }
-
+    char value[2] = { (char)(dcc_safeguard_level + 1 + '0'), '\0' };
     //trace() << "setting safeguard: " << dcc_safeguard_set << endl;
-    if ((putenv(strdup(dcc_safeguard_set)) == -1)) {
+    if (setenv(dcc_safeguard_name, value, 1) == -1) {
         log_error() << "putenv failed" << endl;
     }
 }

@@ -32,9 +32,7 @@
 #include <string.h>
 #include <errno.h>
 #include <vector>
-#ifdef HAVE_SIGNAL_H
 #include <signal.h>
-#endif
 
 #include <comm.h>
 #include "client.h"
@@ -99,7 +97,9 @@ static string compiler_path_lookup_helper(const string &compiler, const string &
                 continue;
             }
 
-            best_match = part;
+            if( best_match.empty()) {
+                best_match = part;
+            }
 
             if (after_selflink) {
                 return part;
@@ -159,9 +159,27 @@ Therefore it is better to only locally merge all #include files into the source
 file and do the actual preprocessing remotely together with compiling.
 There exists a Clang patch to implement option -frewrite-includes that does
 such #include rewritting, and it's been only recently merged upstream.
+
+This is similar with newer gcc versions, and gcc has -fdirectives-only, which
+works similarly to -frewrite-includes (although it's not exactly the same).
 */
 bool compiler_only_rewrite_includes(const CompileJob &job)
 {
+    if( job.blockRewriteIncludes()) {
+        return false;
+    }
+    if (const char *rewrite_includes = getenv("ICECC_REMOTE_CPP")) {
+        return (*rewrite_includes != '\0') && (*rewrite_includes != '0');
+    }
+    if (!compiler_is_clang(job)) {
+#ifdef HAVE_GCC_FDIRECTIVES_ONLY
+        // gcc has had -fdirectives-only for a long time, but clang on macosx poses as gcc
+        // and fails when given the option. Since we right now detect whether a compiler
+        // is gcc merely by checking the binary name, enable usage only if the configure
+        // check found the option working.
+        return true;
+#endif
+    }
     if (compiler_is_clang(job)) {
         if (const char *rewrite_includes = getenv("ICECC_CLANG_REMOTE_CPP")) {
             return (*rewrite_includes != '\0') && (*rewrite_includes != '0');
@@ -177,6 +195,11 @@ bool compiler_only_rewrite_includes(const CompileJob &job)
     }
 
     return false;
+}
+
+string clang_get_default_target(const CompileJob &job)
+{
+    return read_command_output( job.compilerPathname() + " -dumpmachine" );
 }
 
 static volatile int lock_fd = 0;
@@ -220,8 +243,6 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
 
     string compiler_name = find_compiler(job);
 
-    trace() << "invoking: " << compiler_name << endl;
-
     if (compiler_name.empty()) {
         log_error() << "could not find " << job.compilerName() << " in PATH." << endl;
         return EXIT_NO_SUCH_FILE;
@@ -243,22 +264,18 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
         arguments.push_back(job.outputFile());
     }
 
-    vector<char*> argv; 
+    vector<char*> argv;
+    string argstxt;
 
     for (list<string>::const_iterator it = arguments.begin(); it != arguments.end(); ++it) {
         argv.push_back(strdup(it->c_str()));
+        argstxt += ' ';
+        argstxt += *it;
     }
 
     argv.push_back(0);
-#if CLIENT_DEBUG
-    trace() << "execing ";
 
-    for (int i = 0; argv.at(i); i++) {
-        trace() << argv.at(i) << " ";
-    }
-
-    trace() << endl;
-#endif
+    trace() << "invoking:" << argstxt << endl;
 
     if (!local_daemon) {
         int fd;
@@ -304,6 +321,7 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
         }
 
         execv(argv[0], &argv[0]);
+        int exitcode = ( errno == ENOENT ? 127 : 126 );
         log_perror("execv failed");
 
         if (lock_fd) {
@@ -316,7 +334,7 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
             log_perror(buf);
         }
 
-        _exit(-1);
+        _exit(exitcode);
     }
     for(vector<char*>::const_iterator i = argv.begin(); i != argv.end(); ++i){
         free(*i);
@@ -339,9 +357,9 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
     if (color_output) {
         string s_ccout;
         char buf[250];
-        int r;
 
         for (;;) {
+	    int r;
             while ((r = read(pf[0], buf, sizeof(buf) - 1)) > 0) {
                 buf[r] = '\0';
                 s_ccout.append(buf);

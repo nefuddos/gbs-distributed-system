@@ -158,7 +158,7 @@ int handle_connection(const string &basedir, CompileJob *job,
         return pid;
     }
 
-    reset_debug(0);
+    reset_debug();
     if ((-1 == close(socket[0])) && (errno != EBADF)){
         log_perror("close failed");
     }
@@ -173,9 +173,8 @@ int handle_connection(const string &basedir, CompileJob *job,
                       << endl;
     }
 
-    Msg *msg = 0; // The current read message
-    unsigned int job_id = 0;
     string tmp_path, obj_file, dwo_file;
+    int exit_code = 0;
 
     try {
         if (job->environmentVersion().size()) {
@@ -203,13 +202,13 @@ int handle_connection(const string &basedir, CompileJob *job,
         int ret;
         unsigned int job_stat[8];
         CompileResultMsg rmsg;
-        job_id = job->jobID();
+        unsigned int job_id = job->jobID();
 
         memset(job_stat, 0, sizeof(job_stat));
 
         char *tmp_output = 0;
         char prefix_output[32]; // 20 for 2^64 + 6 for "icecc-" + 1 for trailing NULL
-        sprintf(prefix_output, "icecc-%d", job_id);
+        sprintf(prefix_output, "icecc-%u", job_id);
 
         if (job->dwarfFissionEnabled() && (ret = dcc_make_tmpdir(&tmp_output)) == 0) {
             tmp_path = tmp_output;
@@ -262,7 +261,7 @@ int handle_connection(const string &basedir, CompileJob *job,
             obj_file = output_dir + '/' + file_name;
             dwo_file = obj_file.substr(0, obj_file.find_last_of('.')) + ".dwo";
 
-            ret = work_it(*job, job_stat, client, rmsg, tmp_path, job_working_dir, relative_file_path, mem_limit, client->fd, -1);
+            ret = work_it(*job, job_stat, client, rmsg, tmp_path, job_working_dir, relative_file_path, mem_limit, client->fd);
         }
         else if ((ret = dcc_make_tmpnam(prefix_output, ".o", &tmp_output, 0)) == 0) {
             obj_file = tmp_output;
@@ -270,7 +269,7 @@ int handle_connection(const string &basedir, CompileJob *job,
             string build_path = obj_file.substr(0, obj_file.find_last_of('/'));
             string file_name = obj_file.substr(obj_file.find_last_of('/')+1);
 
-            ret = work_it(*job, job_stat, client, rmsg, build_path, "", file_name, mem_limit, client->fd, -1);
+            ret = work_it(*job, job_stat, client, rmsg, build_path, "", file_name, mem_limit, client->fd);
         }
 
         if (ret) {
@@ -311,17 +310,17 @@ int handle_connection(const string &basedir, CompileJob *job,
 
         throw myexception(rmsg.status);
 
-    } catch (myexception e) {
+    } catch (const myexception& e) {
         delete client;
         client = 0;
 
         if (!obj_file.empty()) {
-            if (-1 == unlink(obj_file.c_str())){
+            if (-1 == unlink(obj_file.c_str()) && errno != ENOENT){
                 log_perror("unlink failure") << "\t" << obj_file << endl;
             }
         }
         if (!dwo_file.empty()) {
-            if (-1 == unlink(dwo_file.c_str())){
+            if (-1 == unlink(dwo_file.c_str()) && errno != ENOENT){
                 log_perror("unlink failure") << "\t" << dwo_file << endl;
             }
         }
@@ -329,9 +328,9 @@ int handle_connection(const string &basedir, CompileJob *job,
             rmpath(tmp_path.c_str());
         }
 
-        delete msg;
         delete job;
 
-        _exit(e.exitcode());
+        exit_code = e.exitcode();
     }
+    _exit(exit_code);
 }

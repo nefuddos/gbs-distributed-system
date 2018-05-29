@@ -64,7 +64,6 @@ int dcc_make_tmpnam(const char *prefix, const char *suffix, char **name_ret, int
 {
     unsigned long random_bits;
     unsigned long tries = 0;
-    int fd;
     size_t tmpname_length;
     char *tmpname;
 
@@ -77,16 +76,12 @@ int dcc_make_tmpnam(const char *prefix, const char *suffix, char **name_ret, int
 
     random_bits = (unsigned long) getpid() << 16;
 
-# if HAVE_GETTIMEOFDAY
     {
         struct timeval tv;
         gettimeofday(&tv, NULL);
         random_bits ^= tv.tv_usec << 16;
         random_bits ^= tv.tv_sec;
     }
-# else
-    random_bits ^= time(NULL);
-# endif
 
 #if 0
     random_bits = 0;            /* FOR TESTING */
@@ -107,7 +102,7 @@ int dcc_make_tmpnam(const char *prefix, const char *suffix, char **name_ret, int
          *
          * The permissions are tight because nobody but this process
          * and our children should do anything with it. */
-        fd = open(tmpname, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        int fd = open(tmpname, O_WRONLY | O_CREAT | O_EXCL, 0600);
 
         if (fd == -1) {
             /* Don't try getting a file too often.  Safety net against

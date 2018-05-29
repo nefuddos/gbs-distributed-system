@@ -140,7 +140,7 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
         int argc = flags.size();
         argc++; // the program
         argc += 2; // -E file.i
-        argc += 1; // -frewrite-includes
+        argc += 1; // -frewrite-includes / -fdirectives-only
         argv = new char*[argc + 1];
         argv[0] = strdup(find_compiler(job).c_str());
         int i = 1;
@@ -153,21 +153,22 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
         argv[i++] = strdup(job.inputFile().c_str());
 
         if (compiler_only_rewrite_includes(job)) {
-            argv[i++] = strdup("-frewrite-includes");
+            if( compiler_is_clang(job)) {
+                argv[i++] = strdup("-frewrite-includes");
+            } else { // gcc
+                argv[i++] = strdup("-fdirectives-only");
+            }
         }
 
         argv[i++] = 0;
     }
 
-#if 0
-    printf("forking ");
-
-    for (int index = 0; argv[index]; index++) {
-        printf("%s ", argv[index]);
+    string argstxt = argv[ 0 ];
+    for( int i = 1; argv[ i ] != NULL; ++i ) {
+        argstxt += ' ';
+        argstxt += argv[ i ];
     }
-
-    printf("\n");
-#endif
+    trace() << "preparing source to send: " << argstxt << endl;
 
     if (fdwrite != STDOUT_FILENO) {
         /* Ignore failure */
@@ -178,6 +179,7 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
 
     dcc_increment_safeguard();
     execv(argv[0], argv);
+    int exitcode = ( errno == ENOENT ? 127 : 126 );
     log_perror("execv failed");
-    _exit(-1);
+    _exit(exitcode);
 }

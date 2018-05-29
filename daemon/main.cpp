@@ -37,9 +37,7 @@
 #include <netdb.h>
 #include <getopt.h>
 
-#ifdef HAVE_SIGNAL_H
 #include <signal.h>
-#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -68,10 +66,6 @@
 #  include <resolv.h>
 #endif
 #include <netdb.h>
-
-#ifdef HAVE_SYS_RESOURCE_H
-#  include <sys/resource.h>
-#endif
 
 #ifndef RUSAGE_SELF
 #  define RUSAGE_SELF (0)
@@ -411,13 +405,20 @@ void usage(const char *reason = 0)
         cerr << reason << endl;
     }
 
-    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--no-remote] [-w] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
+    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
         " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>]" << endl;
     exit(1);
 }
 
 struct timeval last_stat;
+
+// Initial rlimit for a compile job, measured in megabytes.  Will vary with
+// the amount of available memory.
 int mem_limit = 100;
+
+// Minimum rlimit for a compile job, measured in megabytes.
+const int min_mem_limit = 100;
+
 unsigned int max_kids = 0;
 
 size_t cache_size_limit = 100 * 1024 * 1024;
@@ -431,6 +432,12 @@ struct NativeEnvironment {
     time_t gpp_bin_timestamp;
     time_t clang_bin_timestamp;
     int create_env_pipe; // if in progress of creating the environment
+    NativeEnvironment() {
+        gcc_bin_timestamp = 0;
+        gpp_bin_timestamp = 0;
+        clang_bin_timestamp = 0;
+        create_env_pipe = 0;
+    }
 };
 
 struct Daemon {
@@ -608,7 +615,8 @@ bool Daemon::setup_listen_fds()
 
     myaddr.sun_family = AF_UNIX;
 
-    mode_t old_umask = -1U;
+    bool reset_umask = false;
+    mode_t old_umask = 0;
 
     if (getenv("ICECC_TEST_SOCKET") == NULL) {
 #ifdef HAVE_LIBCAP_NG
@@ -623,10 +631,11 @@ bool Daemon::setup_listen_fds()
             if(default_socket.length() > sizeof(myaddr.sun_path) - 1) {
                 log_error() << "default socket path too long for sun_path" << endl;	
             }
-            if (-1 == unlink(myaddr.sun_path)){
+            if (-1 == unlink(myaddr.sun_path) && errno != ENOENT){
                 log_perror("unlink failed") << "\t" << myaddr.sun_path << endl;
             }
             old_umask = umask(0);
+            reset_umask = true;
         } else { // Started by user.
             if( getenv( "HOME" )) {
                 string socket_path = getenv("HOME");
@@ -636,7 +645,7 @@ bool Daemon::setup_listen_fds()
                 if(socket_path.length() > sizeof(myaddr.sun_path) - 1) {
                     log_error() << "$HOME/.iceccd.socket path too long for sun_path" << endl;
                 }
-                if (-1 == unlink(myaddr.sun_path)){
+                if (-1 == unlink(myaddr.sun_path) && errno != ENOENT){
                     log_perror("unlink failed") << "\t" << myaddr.sun_path << endl;
                 }
             } else {
@@ -651,7 +660,7 @@ bool Daemon::setup_listen_fds()
         if(test_socket.length() > sizeof(myaddr.sun_path) - 1) {
             log_error() << "$ICECC_TEST_SOCKET path too long for sun_path" << endl;
         }
-        if (-1 == unlink(myaddr.sun_path)){
+        if (-1 == unlink(myaddr.sun_path) && errno != ENOENT){
             log_perror("unlink failed") << "\t" << myaddr.sun_path << endl;
         }
     }
@@ -659,14 +668,14 @@ bool Daemon::setup_listen_fds()
     if (bind(unix_listen_fd, (struct sockaddr*)&myaddr, sizeof(myaddr)) < 0) {
         log_perror("bind()");
 
-        if (old_umask != -1U) {
+        if (reset_umask) {
             umask(old_umask);
         }
 
         return false;
     }
 
-    if (old_umask != -1U) {
+    if (reset_umask) {
         umask(old_umask);
     }
 
@@ -751,6 +760,9 @@ void Daemon::close_scheduler()
     delete discover;
     discover = 0;
     next_scheduler_connect = time(0) + 20 + (rand() & 31);
+    static bool fast_reconnect = getenv( "ICECC_TESTS" ) != NULL;
+    if( fast_reconnect )
+        next_scheduler_connect = time(0) + 3;
 }
 
 bool Daemon::maybe_stats(bool send_ping)
@@ -766,9 +778,7 @@ bool Daemon::maybe_stats(bool send_ping)
         unsigned long idleLoad = 0;
         unsigned long niceLoad = 0;
 
-        if (!fill_stats(idleLoad, niceLoad, memory_fillgrade, &msg, clients.active_processes)) {
-            return false;
-        }
+        fill_stats(idleLoad, niceLoad, memory_fillgrade, &msg, clients.active_processes);
 
         time_t diff_stat = (now.tv_sec - last_stat.tv_sec) * 1000 + (now.tv_usec - last_stat.tv_usec) / 1000;
         last_stat = now;
@@ -826,7 +836,7 @@ bool Daemon::maybe_stats(bool send_ping)
 #endif
 
         // Matz got in the urine that not all CPUs are always feed
-        mem_limit = std::max(int(msg.freeMem / std::min(std::max(max_kids, 1U), 4U)), int(100U));
+        mem_limit = std::max(int(msg.freeMem / std::min(std::max(max_kids, 1U), 4U)), min_mem_limit);
 
         if (abs(int(msg.load) - current_load) >= 100 || send_ping) {
             if (!send_scheduler(msg)) {
@@ -888,14 +898,13 @@ string Daemon::dump_internals() const
     unsigned long idleLoad = 0;
     unsigned long niceLoad = 0;
 
-    if (fill_stats(idleLoad, niceLoad, memory_fillgrade, &msg, clients.active_processes)) {
-        result += "  cpu: " + toString(idleLoad) + " idle, "
-                  + toString(niceLoad) + " nice\n";
-        result += "  load: " + toString(msg.loadAvg1 / 1000.) + ", icecream_load: "
-                  + toString(icecream_load) + "\n";
-        result += "  memory: " + toString(memory_fillgrade)
-                  + " (free: " + toString(msg.freeMem) + ")\n";
-    }
+    fill_stats(idleLoad, niceLoad, memory_fillgrade, &msg, clients.active_processes);
+    result += "  cpu: " + toString(idleLoad) + " idle, "
+              + toString(niceLoad) + " nice\n";
+    result += "  load: " + toString(msg.loadAvg1 / 1000.) + ", icecream_load: "
+              + toString(icecream_load) + "\n";
+    result += "  memory: " + toString(memory_fillgrade)
+              + " (free: " + toString(msg.freeMem) + ")\n";
 
     return result;
 }
@@ -944,7 +953,7 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
 int Daemon::scheduler_no_cs(NoCSMsg *msg)
 {
     Client *c = clients.find_by_client_id(msg->client_id);
-    trace() << "handle_use_cs " << msg->job_id << " " << msg->client_id
+    trace() << "handle_no_cs " << msg->job_id << " " << msg->client_id
             << " " << c << " " <<  endl;
 
     if (!c) {
@@ -1228,10 +1237,18 @@ bool Daemon::create_env_finished(string env_key)
     trace() << "cache_size = " << cache_size << endl;
 
     if (!installed_size) {
-        for (Clients::const_iterator it = clients.begin(); it != clients.end(); ++it)  {
-            if (it->second->pending_create_env == env_key) {
-                it->second->channel->send_msg(EndMsg());
-                handle_end(it->second, 121);
+        bool repeat = true;
+        while(repeat) {
+            repeat = false;
+            for (Clients::const_iterator it = clients.begin(); it != clients.end(); ++it)  {
+                if (it->second->pending_create_env == env_key) {
+                    it->second->channel->send_msg(EndMsg());
+                    handle_end(it->second, 121);
+                    // The handle_end call invalidates our iterator, so break out of the loop,
+                    // but try again just in case, until there's no match.
+                    repeat = true;
+                    break;
+                }
             }
         }
         return false;
@@ -1324,7 +1341,7 @@ void Daemon::handle_old_request()
             int sock = -1;
             pid_t pid = -1;
 
-            trace() << "requests--" << job->jobID() << endl;
+            trace() << "request for job " << job->jobID() << endl;
 
             string envforjob = job->targetPlatform() + "/" + job->environmentVersion();
             envs_last_use[envforjob] = time(NULL);
@@ -1374,7 +1391,6 @@ bool Daemon::handle_compile_done(Client *client)
         msg->user_msec = job_stat[JobStatistics::user_msec];
         msg->sys_msec = job_stat[JobStatistics::sys_msec];
         msg->pfaults = job_stat[JobStatistics::sys_pfaults];
-        end_status = job_stat[JobStatistics::exit_code];
     }
 
     close(client->pipe_to_child);
@@ -1810,6 +1826,12 @@ int Daemon::answer_client_requests()
         log_perror("select");
         return 5;
     }
+    // Reset debug if needed, but only if we aren't waiting for any child processes to finish,
+    // otherwise their debug output could end up reset in the middle (and flush log marks used
+    // by tests could be written out before debug output from children).
+    if( current_kids == 0 ) {
+        reset_debug_if_needed();
+    }
 
     if (ret > 0) {
         bool had_scheduler = scheduler;
@@ -1977,7 +1999,7 @@ bool Daemon::reconnect()
     }
 
     if (!discover && next_scheduler_connect > time(0)) {
-        trace() << "timeout.." << endl;
+        trace() << "Delaying reconnect." << endl;
         return false;
     }
 
@@ -1991,7 +2013,7 @@ bool Daemon::reconnect()
     }
 
     if (!scheduler) {
-        log_warning() << "scheduler not yet found." << endl;
+        log_warning() << "scheduler not yet found/selected." << endl;
         return false;
     }
 
@@ -2071,7 +2093,7 @@ int main(int argc, char **argv)
             { 0, 0, 0, 0 }
         };
 
-        const int c = getopt_long(argc, argv, "N:n:m:l:s:whvdrb:u:p:", long_options, &option_index);
+        const int c = getopt_long(argc, argv, "N:n:m:l:s:hvdb:u:p:", long_options, &option_index);
 
         if (c == -1) {
             break;    // eoo
@@ -2138,14 +2160,8 @@ int main(int argc, char **argv)
             break;
         case 'v':
 
-            if (debug_level & Warning)
-                if (debug_level & Info) { // for second call
-                    debug_level |= Debug;
-                } else {
-                    debug_level |= Info;
-                }
-            else {
-                debug_level |= Warning;
+            if (debug_level < MaxVerboseLevel) {
+                debug_level++;
             }
 
             break;
@@ -2233,7 +2249,7 @@ int main(int argc, char **argv)
     }
 
     if (d.warn_icecc_user_errno != 0) {
-        log_errno("Error: no icecc user on system. Falling back to nobody.", d.warn_icecc_user_errno);
+        log_errno("No icecc user on system. Falling back to nobody.", d.warn_icecc_user_errno);
     }
 
     umask(022);

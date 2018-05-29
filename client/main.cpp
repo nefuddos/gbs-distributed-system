@@ -54,14 +54,13 @@
 #include <comm.h>
 #include <vector>
 #include <sys/types.h>
-#ifdef HAVE_SYS_STAT_H
-#  include <sys/stat.h>
-#endif
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include "client.h"
 #include "platform.h"
 #include "util.h"
+#include "argv.h"
 
 using namespace std;
 
@@ -72,7 +71,7 @@ static void dcc_show_usage(void)
     printf(
         "Usage:\n"
         "   icecc [compiler] [compile options] -o OBJECT -c SOURCE\n"
-        "   icecc --build-native [compilertype] [file...]\n"
+        "   icecc --build-native [compiler] [file...]\n"
         "   icecc --help\n"
         "\n"
         "Options:\n"
@@ -84,7 +83,7 @@ static void dcc_show_usage(void)
         "                              If set to \"disable\", just exec the real compiler, but without\n"
         "                              notifying the daemon and only run one job at a time.\n"
         "   ICECC_VERSION              use a specific icecc environment, see icecc-create-env\n"
-        "   ICECC_DEBUG                [info | warnings | debug]\n"
+        "   ICECC_DEBUG                [info | warning | debug]\n"
         "                              sets verboseness of icecream client.\n"
         "   ICECC_LOGFILE              if set, additional debug information is logged to the specified file\n"
         "   ICECC_REPEAT_RATE          the number of jobs out of 1000 that should be\n"
@@ -93,7 +92,7 @@ static void dcc_show_usage(void)
         "   ICECC_PREFERRED_HOST       overrides scheduler decisions if set.\n"
         "   ICECC_CC                   set C compiler name (default gcc).\n"
         "   ICECC_CXX                  set C++ compiler name (default g++).\n"
-        "   ICECC_CLANG_REMOTE_CPP     set to 1 or 0 to override remote preprocessing with clang\n"
+        "   ICECC_REMOTE_CPP           set to 1 or 0 to override remote preprocessing\n"
         "   ICECC_IGNORE_UNVERIFIED    if set, hosts where environment cannot be verified are not used.\n"
         "   ICECC_EXTRAFILES           additional files used in the compilation.\n"
         "   ICECC_COLOR_DIAGNOSTICS    set to 1 or 0 to override color diagnostics support.\n"
@@ -113,7 +112,7 @@ static void icerun_show_usage(void)
         "   --version                  show version and exit\n"
         "Environment Variables:\n"
         "   ICECC                      if set to \"no\", just exec the real command\n"
-        "   ICECC_DEBUG                [info | warnings | debug]\n"
+        "   ICECC_DEBUG                [info | warning | debug]\n"
         "                              sets verboseness of icecream client.\n"
         "   ICECC_LOGFILE              if set, additional debug information is logged to the specified file\n"
         "\n");
@@ -143,44 +142,33 @@ static void dcc_client_catch_signals(void)
     signal(SIGHUP, &dcc_client_signalled);
 }
 
-static string read_output(const char *command)
-{
-    FILE *f = popen(command, "r");
-    string output;
-
-    if (!f) {
-        log_error() << "no pipe " << strerror(errno) << endl;
-        return output;
-    }
-
-    char buffer[1024];
-
-    while (!feof(f)) {
-        size_t bytes = fread(buffer, 1, sizeof(buffer) - 1, f);
-        buffer[bytes] = 0;
-        output += buffer;
-    }
-
-    pclose(f);
-    // get rid of the endline
-    return output.substr(0, output.length() - 1);
-}
-
 /*
- * @param args Are [clang,gcc] [extra files...]
+ * @param args Are [compiler] [extra files...]
+ * Compiler can be "gcc", "clang" or a binary (possibly including a path).
  */
 static int create_native(char **args)
 {
-    bool is_clang = false;
     char **extrafiles = args;
     string machine_name = determine_platform();
 
-    if (machine_name.find("Darwin") == 0)
-        is_clang = true;
-    // Args[0] may be a compiler or the first extra file.
-    if (args[0] && ((!strcmp(args[0], "clang") && (is_clang = true))
-                    || (!strcmp(args[0], "gcc") && !(is_clang = false)))) {
-        extrafiles++;
+    string compiler = "gcc";
+    if (machine_name.compare(0, 6, "Darwin") == 0) {
+        compiler = "clang";
+    }
+    if (args[0]) {
+        if( strcmp(args[0], "clang") == 0 || strcmp(args[0], "gcc") == 0 ) {
+            compiler = args[ 0 ];
+            ++extrafiles;
+        } else if( access( args[0], R_OK ) == 0 && access( args[ 0 ], X_OK ) != 0 ) {
+            // backwards compatibility, the first argument is already an extra file
+        } else {
+            compiler = compiler_path_lookup( args[ 0 ] );
+            if (compiler.empty()) {
+                log_error() << "compiler not found" << endl;
+                return 1;
+            }
+            ++extrafiles;
+        }
     }
 
     vector<char*> argv;
@@ -192,46 +180,7 @@ static int create_native(char **args)
     }
 
     argv.push_back(strdup(BINDIR "/icecc-create-env"));
-
-    if (is_clang) {
-        string clang = compiler_path_lookup("clang");
-
-        if (clang.empty()) {
-            log_error() << "clang compiler not found" << endl;
-            return 1;
-        }
-
-        if (lstat(PLIBDIR "/compilerwrapper", &st)) {
-            log_error() << PLIBDIR "/compilerwrapper does not exist" << endl;
-            return 1;
-        }
-
-        argv.push_back(strdup("--clang"));
-        argv.push_back(strdup(clang.c_str()));
-        argv.push_back(strdup(PLIBDIR "/compilerwrapper"));
-    } else { // "gcc" (default)
-        string gcc, gpp;
-
-        // perhaps we're on gentoo
-        if (!lstat("/usr/bin/gcc-config", &st)) {
-            string gccpath = read_output("/usr/bin/gcc-config -B") + "/";
-            gcc = gccpath + "gcc";
-            gpp = gccpath + "g++";
-        } else {
-            gcc = compiler_path_lookup("gcc");
-            gpp = compiler_path_lookup("g++");
-        }
-
-        // both C and C++ compiler are required
-        if (gcc.empty() || gpp.empty()) {
-            log_error() << "gcc compiler not found" << endl;
-            return 1;
-        }
-
-        argv.push_back(strdup("--gcc"));
-        argv.push_back(strdup(gcc.c_str()));
-        argv.push_back(strdup(gpp.c_str()));
-    }
+    argv.push_back(strdup(compiler.c_str()));
 
     for (int extracount = 0; extrafiles[extracount]; extracount++) {
         argv.push_back(strdup("--addfile"));
@@ -242,21 +191,80 @@ static int create_native(char **args)
     execv(argv[0], argv.data());
     log_perror("execv failed");
     return -1;
-
 }
+
+static void debug_arguments(int argc, char** argv, bool original)
+{
+    string argstxt = argv[ 0 ];
+    for( int i = 1; i < argc; ++i ) {
+        argstxt += ' ';
+        argstxt += argv[ i ];
+    }
+    if( original ) {
+        trace() << "invoked as: " << argstxt << endl;
+    } else {
+        trace() << "expanded as: " << argstxt << endl;
+    }
+}
+
+class ArgumentExpander
+{
+public:
+    ArgumentExpander(int *argcp, char ***argvp)
+    {
+        oldargv = *argvp;
+        oldargc = *argcp;
+        expandargv(argcp, argvp);
+
+        newargv = *argvp;
+        if (newargv == oldargv)
+            newargv = NULL;
+    }
+
+    ~ArgumentExpander()
+    {
+        if (newargv != NULL)
+            freeargv(newargv);
+    }
+
+    bool changed() const
+    {
+        return newargv != NULL;
+    }
+
+    char** originalArgv() const
+    {
+        return oldargv;
+    }
+
+    int originalArgc() const
+    {
+        return oldargc;
+    }
+
+private:
+    char ** newargv;
+    char ** oldargv;
+    int oldargc;
+};
 
 int main(int argc, char **argv)
 {
-    char *env = getenv("ICECC_DEBUG");
+    // expand @responsefile contents to arguments in argv array
+    ArgumentExpander expand(&argc, &argv);
+
+    const char *env = getenv("ICECC_DEBUG");
     int debug_level = Error;
 
     if (env) {
         if (!strcasecmp(env, "info"))  {
-            debug_level |= Info | Warning;
-        } else if (!strcasecmp(env, "warnings")) {
-            debug_level |= Warning; // taking out warning
+            debug_level = Info;
+        } else if (!strcasecmp(env, "warning") || !strcasecmp(env, "warnings")) {
+            // "warnings was referred to in the --help output, handle it
+            // backwards compatibility.
+            debug_level = Warning;
         } else { // any other value
-            debug_level |= Info | Debug | Warning;
+            debug_level = Debug;
         }
     }
 
@@ -267,6 +275,11 @@ int main(int argc, char **argv)
     }
 
     setup_debug(debug_level, logfile, "ICECC");
+
+    debug_arguments(expand.originalArgc(), expand.originalArgv(), true);
+    if( expand.changed()) {
+        debug_arguments(argc, argv, false);
+    }
 
     CompileJob job;
     bool icerun = false;
@@ -351,7 +364,7 @@ int main(int argc, char **argv)
        If ICECC is set to no, the job is run locally as well, but it is
        serialized using the daemon, so several may be run at once.
      */
-    char *icecc = getenv("ICECC");
+    const char *icecc = getenv("ICECC");
 
     if (icecc && !strcasecmp(icecc, "disable")) {
         return build_local(job, 0);
@@ -431,7 +444,7 @@ int main(int argc, char **argv)
                 // we just build locally
             }
         } else if (!extrafiles.empty() && !IS_PROTOCOL_32(local_daemon)) {
-            log_warning() << "Local daemon is too old to handle compiler plugins." << endl;
+            log_warning() << "Local daemon is too old to handle extra files." << endl;
             local = true;
         } else {
             if (!local_daemon->send_msg(GetNativeEnvMsg(compiler_is_clang(job)
@@ -499,9 +512,11 @@ int main(int argc, char **argv)
         delete startme;
     } else {
         try {
-            // check if it should be compiled three times
+            // How many times out of 1000 should we recompile a job on
+            // multiple hosts to confirm that the results are the same?
             const char *s = getenv("ICECC_REPEAT_RATE");
             int rate = s ? atoi(s) : 0;
+
             ret = build_remote(job, local_daemon, envs, rate);
 
             /* We have to tell the local daemon that everything is fine and
@@ -526,7 +541,7 @@ int main(int argc, char **argv)
             }
 
             /* currently debugging a client? throw an error then */
-            if (debug_level != Error) {
+            if (debug_level > Error) {
                 return error.errorCode;
             }
 

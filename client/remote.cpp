@@ -63,7 +63,7 @@ namespace
 
 struct CharBufferDeleter {
     char *buf;
-    CharBufferDeleter(char *b) : buf(b) {}
+    explicit CharBufferDeleter(char *b) : buf(b) {}
     ~CharBufferDeleter() {
         free(buf);
     }
@@ -345,7 +345,7 @@ static void receive_file(const string& output_file, MsgChannel* cserver)
         if (msg->type != M_FILE_CHUNK) {
             unlink(tmp_file.c_str());
             delete msg;
-            throw client_error(20, "Error 20 - unexpcted message");
+            throw client_error(20, "Error 20 - unexpected message");
         }
 
         FileChunkMsg *fcmsg = dynamic_cast<FileChunkMsg*>(msg);
@@ -353,6 +353,7 @@ static void receive_file(const string& output_file, MsgChannel* cserver)
         uncompressed += fcmsg->len;
 
         if (write(obj_fd, fcmsg->buffer, fcmsg->len) != (ssize_t)fcmsg->len) {
+            log_perror("Error writing file: ");
             unlink(tmp_file.c_str());
             delete msg;
             throw client_error(21, "Error 21 - error writing file");
@@ -365,8 +366,21 @@ static void receive_file(const string& output_file, MsgChannel* cserver)
 
     delete msg;
 
-    if (close(obj_fd) != 0 || rename(tmp_file.c_str(), output_file.c_str()) != 0) {
-        unlink(tmp_file.c_str());
+    if (close(obj_fd) != 0) {
+        log_perror("Failed to close temporary file: ");
+        if(unlink(tmp_file.c_str()) != 0)
+        {
+            log_perror("delete temporary file - might be related to close failure above");
+        }
+        throw client_error(30, "Error 30 - error closing temp file");
+
+    }
+    if(rename(tmp_file.c_str(), output_file.c_str()) != 0) {
+        log_perror("Failed to rename temporary file: ");
+        if(unlink(tmp_file.c_str()) != 0)
+        {
+            log_perror("delete temporary file - might be related to rename failure above");
+        }
         throw client_error(30, "Error 30 - error closing temp file");
     }
 }
@@ -467,6 +481,13 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             throw client_error(26, "Error 26 - environment on " + hostname + " cannot be verified");
         }
 
+        // Older remotes don't set properly -x argument.
+        if(( job.language() == CompileJob::Lang_OBJC || job.language() == CompileJob::Lang_OBJCXX )
+            && !IS_PROTOCOL_38(cserver)) {
+            job.appendFlag( "-x", Arg_Remote );
+            job.appendFlag( job.language() == CompileJob::Lang_OBJC ? "objective-c" : "objective-c++", Arg_Remote );
+        }
+
         CompileFileMsg compile_file(&job);
         {
             log_block b("send compile_file");
@@ -478,23 +499,6 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         }
 
         if (!preproc_file) {
-            local_daemon->send_msg(JobLocalBeginMsg(0, get_absfilename(job.inputFile())));
-            /* Now wait until the daemon gives us the start signal.  40 minutes
-               should be enough for all normal compile or link jobs.  */
-            Msg *startme = 0L;
-            startme = local_daemon->get_msg(40 * 60);
-            if (!startme) {
-                throw client_error(32, "Error 32 - did not receive job_local_begin reply, before timeout ");
-            }
-            else if(startme->type != M_JOB_LOCAL_BEGIN)
-            {
-                ostringstream unexpected_msg;
-                unexpected_msg <<  "Error 33 - expected job_local_begin reply, but got " << startme->type << " instead";
-                delete startme;
-                throw client_error(33, unexpected_msg.str());
-            }
-            delete startme;
-
             int sockets[2];
 
             if (pipe(sockets)) {
@@ -526,6 +530,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             if (shell_exit_status(status) != 0) {   // failure
                 delete cserver;
                 cserver = 0;
+                log_warning() << "call_cpp process failed with exit status " << shell_exit_status(status) << endl;
                 return shell_exit_status(status);
             }
         } else {
@@ -577,6 +582,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             if ((!crmsg->out.empty() || !crmsg->err.empty()) && output_needs_workaround(job)) {
                 delete crmsg;
                 log_info() << "command needs stdout/stderr workaround, recompiling locally" << endl;
+                log_info() << "(set ICECC_CARET_WORKAROUND=0 to override)" << endl;
                 throw remote_error(102, "Error 102 - command needs stdout/stderr workaround, recompiling locally");
             }
 
@@ -751,19 +757,19 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
     int torepeat = 1;
     bool has_split_dwarf = job.dwarfFissionEnabled();
 
-    // older compilers do not support the options we need to make it reproducible
-#if defined(__GNUC__) && ( ( (__GNUC__ == 3) && (__GNUC_MINOR__ >= 3) ) || (__GNUC__ >=4) )
-
     if (!compiler_is_clang(job)) {
         if (rand() % 1000 < permill) {
             torepeat = 3;
         }
     }
 
-#endif
-
-    trace() << job.inputFile() << " compiled " << torepeat << " times on "
-            << job.targetPlatform() << "\n";
+    if( torepeat == 1 ) {
+        trace() << "preparing " << job.inputFile() << " to be compiled for "
+                << job.targetPlatform() << "\n";
+    } else {
+        trace() << "preparing " << job.inputFile() << " to be compiled " << torepeat << " times for "
+                << job.targetPlatform() << "\n";
+    }
 
     map<string, string> versionfile_map, version_map;
     Environments envs = rip_out_paths(_envs, version_map, versionfile_map);
@@ -816,24 +822,6 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
         char *preproc = 0;
         dcc_make_tmpnam("icecc", ".ix", &preproc, 0);
         const CharBufferDeleter preproc_holder(preproc);
-
-        local_daemon->send_msg(JobLocalBeginMsg(0, get_absfilename(job.inputFile())));
-        /* Now wait until the daemon gives us the start signal.  40 minutes
-           should be enough for all normal compile or link jobs.  */
-        Msg *startme = 0L;
-        startme = local_daemon->get_msg(40 * 60);
-        if (!startme) {
-            throw client_error(32, "Error 32 - did not receive job_local_begin reply, before timeout ");
-        }
-        else if(startme->type != M_JOB_LOCAL_BEGIN)
-        {
-            ostringstream unexpected_msg;
-            unexpected_msg <<  "Error 33 - expected job_local_begin reply, but got " << startme->type << " instead";
-            delete startme;
-            throw client_error(33, unexpected_msg.str());
-        }
-        delete startme;
-
         int cpp_fd = open(preproc, O_WRONLY);
         /* When call_cpp returns normally (for the parent) it will have closed
            the write fd, i.e. cpp_fd.  */
@@ -848,6 +836,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
         waitpid(cpp_pid, &status, 0);
 
         if (shell_exit_status(status)) {   // failure
+            log_warning() << "call_cpp process failed with exit status " << shell_exit_status(status) << endl;
             ::unlink(preproc);
             return shell_exit_status(status);
         }

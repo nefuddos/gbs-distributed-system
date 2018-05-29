@@ -5,12 +5,15 @@ AC_PREREQ([2.63])
 # ====================
 # Version informations
 # ====================
+# Stable versions: x.y.z , where z < 50
+# Development versions: x.y.90
+# Pre-release versions: x.y.z, where z = 90 + X in rcX (1.1rc1 = 1.1.91)
 m4_define([icecream_version_major],[1])
-m4_define([icecream_version_minor],[1rc3])
-#m4_define([icecream_version_micro],[98])
+m4_define([icecream_version_minor],[1])
+m4_define([icecream_version_micro],[90])
 m4_ifval([icecream_version_micro],
-	m4_define([icecream_version],[icecream_version_major.icecream_version_minor.icecream_version_micro]),
-	m4_define([icecream_version],[icecream_version_major.icecream_version_minor]))
+        m4_define([icecream_version],[icecream_version_major.icecream_version_minor.icecream_version_micro]),
+        m4_define([icecream_version],[icecream_version_major.icecream_version_minor]))
 
 # =============
 # Automake init
@@ -92,26 +95,15 @@ AM_CONDITIONAL([WITH_ICECREAM_MAN], [test "x$build_man" != "xno"])
 
 # Some of these are needed by popt (or other libraries included in the future).
 
-AC_CHECK_HEADERS([unistd.h stdint.h signal.h sys/types.h sys/signal.h ifaddrs.h kinfo.h sys/param.h devstat.h])
-AC_CHECK_HEADERS([ctype.h sys/resource.h sys/socket.h sys/socketvar.h sys/stat.h sys/select.h sys/vfs.h])
+AC_CHECK_HEADERS([sys/signal.h ifaddrs.h kinfo.h sys/param.h devstat.h])
+AC_CHECK_HEADERS([sys/socketvar.h sys/vfs.h])
 AC_CHECK_HEADERS([mach/host_info.h])
-AC_CHECK_HEADERS([netinet/in.h], [], [],
-[#if HAVE_SYS_TYPES_H
-# include <sys/types.h>
-#endif
-])
 AC_CHECK_HEADERS([arpa/nameser.h], [], [],
-[#if HAVE_SYS_TYPES_H
-# include <sys/types.h>
-#endif
+[#include <sys/types.h>
 ])
 AC_CHECK_HEADERS([resolv.h], [], [],
-[#if HAVE_SYS_TYPES_H
-# include <sys/types.h>
-#endif
-#if HAVE_NETINET_IN_H
-# include <netinet/in.h>
-#endif
+[#include <sys/types.h>
+#include <netinet/in.h>
 #if HAVE_ARPA_NAMESER_H
 # include <arpa/nameser.h>
 #endif
@@ -120,20 +112,13 @@ AC_CHECK_HEADERS([resolv.h], [], [],
 AC_ARG_VAR(TAR, [Specifies tar path])
 AC_PATH_PROG(TAR, [tar])
 AC_DEFINE_UNQUOTED([TAR], ["$TAR"], [Define path to tar])
-AC_CHECK_HEADERS([float.h mcheck.h alloca.h sys/mman.h netinet/tcp.h])
 AC_CHECK_HEADERS([netinet/tcp_var.h], [], [],
-[#if HAVE_SYS_TYPES_H
-# include <sys/types.h>
-#endif
+[#include <sys/types.h>
 #if HAVE_SYS_SOCKETVAR_H
 # include <sys/socketvar.h>
 #endif
-#if HAVE_NETINET_IN_H
-# include <netinet/in.h>
-#endif
-#if HAVE_NETINET_TCP_H
-# include <netinet/tcp.h>
-#endif
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 ])
 
 AC_CHECK_HEADERS([sys/user.h])
@@ -143,15 +128,9 @@ dnl Checks for types
 
 AC_CHECK_TYPES([sa_family_t, socklen_t, in_port_t, in_addr_t], , ,
 	       [
-#if HAVE_SYS_TYPES_H
-# include <sys/types.h>
-#endif
-#if HAVE_SYS_SOCKET_H
-# include <sys/socket.h>
-#endif
-#if HAVE_NETINET_IN_H
-# include <netinet/in.h>
-#endif
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #if HAVE_ARPA_NAMESER_H
 # include <arpa/nameser.h>
 #endif
@@ -201,18 +180,9 @@ if test x"$ac_cv_func_connect" = x"no"; then
     fi
 fi
 
-AC_CHECK_LIB(resolv, hstrerror, , , [-lnsl -lsocket])
-AC_CHECK_LIB(resolv, inet_aton, , , [-lnsl -lsocket])
-
-AC_CHECK_FUNCS([setsid flock lockf hstrerror strerror setuid setreuid])
-AC_CHECK_FUNCS([getuid geteuid mcheck wait4 wait3 waitpid setgroups getcwd])
-AC_CHECK_FUNCS([snprintf vsnprintf vasprintf asprintf getcwd getwd])
-AC_CHECK_FUNCS([getrusage strsignal gettimeofday])
-AC_CHECK_FUNCS([getaddrinfo getnameinfo inet_ntop inet_ntoa])
-AC_CHECK_FUNCS([strndup mmap strlcpy])
+AC_CHECK_FUNCS([flock lockf])
+AC_CHECK_FUNCS([strsignal])
 AC_CHECK_FUNCS([getloadavg])
-
-AC_CHECK_DECLS([snprintf, vsnprintf, vasprintf, asprintf, strndup])
 
 AC_CHECK_LIB(lzo2, lzo1x_1_compress, LZO_LDADD=-llzo2,
 	AC_MSG_ERROR([Could not find lzo2 library - please install lzo-devel]))
@@ -228,6 +198,8 @@ case $host_os in
 esac
 AC_SUBST(LIB_KINFO)
 
+AC_CHECK_PROG(CLANG,clang,clang)
+
 AC_ARG_ENABLE(clang-rewrite-includes,
     AS_HELP_STRING([--enable-clang-rewrite-includes],
         [Use by default Clang's -frewrite-includes option.]))
@@ -237,7 +209,6 @@ if test "$enable_clang_rewrite_includes" = "yes"; then
 elif test "$enable_clang_rewrite_includes" = "no"; then
     true  # do not enable
 else
-    AC_CHECK_PROG(CLANG,clang,clang)
     if test -n "$CLANG"; then
         AC_MSG_CHECKING([whether clang -Werror works for unknown options])
         $CLANG -Werror -totallybogusoption -E - >/dev/null 2>/dev/null
@@ -258,17 +229,6 @@ else
     fi
 fi
 
-HAVE_CLANG_DEVEL_DEP=
-AC_CHECK_PROG(CLANG,clang,clang)
-AC_LANG_PUSH([C++])
-save_CPPFLAGS=$CPPFLAGS
-CPPFLAGS="$CPPFLAGS -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
-AC_CHECK_HEADER(clang/AST/RecursiveASTVisitor.h,
-    [ HAVE_CLANG_DEVEL_DEP=clangplugin ] )
-CPPFLAGS="$save_CPPFLAGS"
-AC_LANG_POP([C++])
-AC_SUBST(HAVE_CLANG_DEVEL_DEP)
-
 AC_ARG_ENABLE(clang-wrappers,
     AS_HELP_STRING([--enable-clang-wrappers],
         [Use symlink wrappers for clang/clang++.]))
@@ -279,7 +239,6 @@ if test "$enable_clang_wrappers" = "yes"; then
 elif test "$enable_clang_wrappers" = "no"; then
     true # do not enable
 else
-    AC_CHECK_PROG(CLANG,clang,clang)
     if test -n "$CLANG"; then
         CLANG_SYMLINK_WRAPPERS='clang clang++'
     fi
@@ -318,6 +277,42 @@ else
     fi
 fi
 
+AC_ARG_ENABLE(gcc-fdirectives-only,
+    AS_HELP_STRING([--enable-gcc-fdirectives-only],
+        [Use by default GCC's -fdirectives-only option.]))
+
+if test "$enable_gcc_fdirectives_only" = "yes"; then
+    AC_DEFINE(HAVE_GCC_FDIRECTIVES_ONLY, 1, [Define to 1 if gcc supports -fdirectives-only])
+elif test "$enable_gcc_fdirectives_only" = "no"; then
+    true  # do not enable
+else
+    AC_CHECK_PROG(GCC_BIN,gcc,gcc)
+    AC_MSG_CHECKING([whether $GCC_BIN -Werror works for unknown options])
+    $GCC_BIN -Werror -totallybogusoption -E - >/dev/null 2>/dev/null
+    if test $? -eq 0; then
+        AC_MSG_RESULT(no)
+        # can't detect if the option is supported, but that's too old clang anyway
+    else
+        AC_MSG_RESULT(yes)
+        AC_MSG_CHECKING([for $GCC_BIN -E -fdirectives-only])
+        $GCC_BIN -Werror -E -fdirectives-only - >/dev/null 2>/dev/null
+        if test $? -eq 0; then
+            AC_MSG_RESULT(yes)
+            AC_DEFINE(HAVE_GCC_FDIRECTIVES_ONLY, 1, [Define to 1 if gcc supports -fdirectives-only])
+        else
+            AC_MSG_RESULT(no)
+        fi
+    fi
+fi
+
+AC_MSG_CHECKING([for -fsanitize= usage])
+if echo "$CXXFLAGS" | grep -q -- -fsanitize; then
+    AC_DEFINE(SANITIZER_USED, 1, [Define to 1 if compiled with -fsanitize option(s)])
+    AC_MSG_RESULT(yes)
+else
+    AC_MSG_RESULT(no)
+fi
+
 AC_CONFIG_FILES([ Makefile ])
 AC_CONFIG_FILES([ client/Makefile ])
 AC_CONFIG_FILES([ daemon/Makefile ])
@@ -329,6 +324,8 @@ AC_CONFIG_FILES([ compilerwrapper/Makefile ])
 AC_CONFIG_FILES([ scheduler/Makefile ])
 AC_CONFIG_FILES([ tests/Makefile ])
 AC_CONFIG_FILES([ client/icecc-create-env ])
+AC_CONFIG_FILES([ client/icecc-test-env ])
+AC_CONFIG_FILES([ tests/test-setup.sh ])
 AC_OUTPUT([ suse/icecream.spec ])
 if test "$prefix" = NONE; then
   prefix=$ac_default_prefix

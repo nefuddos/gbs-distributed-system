@@ -78,6 +78,11 @@ struct CPULoadInfo {
     load_t waitTicks;
 
     CPULoadInfo() {
+        userLoad = 0;
+        niceLoad = 0;
+        sysLoad = 0;
+        idleLoad = 0;
+
         userTicks = 0;
         niceTicks = 0;
         sysTicks = 0;
@@ -216,7 +221,7 @@ static void updateCPULoad(CPULoadInfo *load)
     load->waitTicks = currWaitTicks;
 }
 
-#ifndef USE_SYSCTL
+#if !defined(USE_SYSCTL) && !defined(USE_MACH)
 static unsigned long int scan_one(const char *buff, const char *key)
 {
     const char *b = strstr(buff, key);
@@ -383,7 +388,7 @@ int fakeloadavg(double *p_result, int resultEntries, unsigned int currentJobs)
     return numFilled;
 }
 
-bool fill_stats(unsigned long &myidleload, unsigned long &myniceload, unsigned int &memory_fillgrade, StatsMsg *msg, unsigned int hint)
+void fill_stats(unsigned long &myidleload, unsigned long &myniceload, unsigned int &memory_fillgrade, StatsMsg *msg, unsigned int hint)
 {
     static CPULoadInfo load;
 
@@ -411,6 +416,4 @@ bool fill_stats(unsigned long &myidleload, unsigned long &myniceload, unsigned i
         msg->freeMem = (load_t)(MemFree / 1024.0 + 0.5);
 
     }
-
-    return true;
 }
