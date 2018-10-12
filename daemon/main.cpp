@@ -22,12 +22,12 @@
 */
 
 //#define ICECC_DEBUG 1
-#include"Client.h"
-#include"Clients.h"
-#include"Daemon.h"
+#ifndef DAEMON_HEAD
+#define DAEMON_HEAD
+#include "Daemon.h"
+#endif // !DAEMON_HEAD
 
 static std::string pidFilePath;
-static volatile sig_atomic_t exit_main_loop = 0;
 
 #ifndef __attribute_warn_unused_result__
 #define __attribute_warn_unused_result__
@@ -94,7 +94,7 @@ static void dcc_daemon_terminate(int whichsig)
      * Don't call printf. and especially don't call the log_*() functions.
      */
 
-    if (exit_main_loop > 1) {
+    if (Daemon::exit_main_loop > 1) {
         // The > 1 is because we get one more signal from the kill(0,...) below.
         // hmm, we got killed already twice. try better
         static const char msg[] = "forced exit.\n";
@@ -107,7 +107,7 @@ static void dcc_daemon_terminate(int whichsig)
 
     bool am_parent = (getpid() == dcc_master_pid);
 
-    if (am_parent && exit_main_loop == 0) {
+    if (am_parent && Daemon::exit_main_loop == 0) {
         /* kill whole group */
         kill(0, whichsig);
 
@@ -115,7 +115,7 @@ static void dcc_daemon_terminate(int whichsig)
         unlink(pidFilePath.c_str());
     }
 
-    ++exit_main_loop;
+    Daemon::exit_main_loop++;
 }
 
 void usage(const char *reason = 0)
@@ -128,39 +128,6 @@ void usage(const char *reason = 0)
         " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>]" << endl;
     exit(1);
 }
-
-struct timeval last_stat;
-
-// Initial rlimit for a compile job, measured in megabytes.  Will vary with
-// the amount of available memory.
-int mem_limit = 100;
-
-// Minimum rlimit for a compile job, measured in megabytes.
-const int min_mem_limit = 100;
-
-unsigned int max_kids = 0;
-
-size_t cache_size_limit = 100 * 1024 * 1024;
-
-struct NativeEnvironment {
-    string name; // the hash
-    map<string, time_t> extrafilestimes;
-    // Timestamps for compiler binaries, if they have changed since the time
-    // the native env was built, it needs to be rebuilt.
-    time_t gcc_bin_timestamp;
-    time_t gpp_bin_timestamp;
-    time_t clang_bin_timestamp;
-    int create_env_pipe; // if in progress of creating the environment
-    NativeEnvironment() {
-        gcc_bin_timestamp = 0;
-        gpp_bin_timestamp = 0;
-        clang_bin_timestamp = 0;
-        create_env_pipe = 0;
-    }
-};
-
-
-
 
 
 int main(int argc, char **argv)
@@ -227,7 +194,7 @@ int main(int argc, char **argv)
                     int mb = atoi(optarg);
 
                     if (!errno) {
-                        cache_size_limit = mb * 1024 * 1024;
+                        Daemon::cache_size_limit = mb * 1024 * 1024;
                     }
                 } else {
                     usage("Error: --cache-limit requires argument");
@@ -418,12 +385,12 @@ int main(int argc, char **argv)
     }
 
     if (max_processes < 0) {
-        max_kids = d.num_cpus;
+        Daemon::max_kids = d.num_cpus;
     } else {
-        max_kids = max_processes;
+        Daemon::max_kids = max_processes;
     }
 
-    log_info() << "allowing up to " << max_kids << " active jobs" << endl;
+    log_info() << "allowing up to " << Daemon::max_kids << " active jobs" << endl;
 
     int ret;
 

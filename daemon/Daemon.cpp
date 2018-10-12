@@ -20,7 +20,15 @@
     with this program; if not, write to the Free Software Foundation, Inc.,
     51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 */
-#include"Daemon.h"
+#ifndef DAEMON_HEAD
+#define DAEMON_HEAD
+#include "Daemon.h"
+#endif // !DAEMON_HEAD
+struct timeval last_stat;
+unsigned int Daemon::max_kids = 0;
+volatile sig_atomic_t Daemon::exit_main_loop = 0;
+size_t Daemon::cache_size_limit = 100 * 1024 * 1024;
+int Daemon::mem_limit = 100;
 bool Daemon::setup_listen_fds()
 {
     tcp_listen_fd = -1;
