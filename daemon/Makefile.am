@@ -7,7 +7,8 @@ iceccd_SOURCES = \
 	workit.cpp \
 	environment.cpp \
 	load.cpp \
-	file_util.cpp
+	file_util.cpp \
+	Daemon.cpp
 
 iceccd_LDADD = \
 	../services/libicecc.la \
@@ -23,4 +24,9 @@ noinst_HEADERS = \
 	ncpus.h \
 	serve.h \
 	workit.h \
-	file_util.h
+	file_util.h \
+	Client.h \
+	Clients.h \
+	Daemon.h \
+	NativeEnvironment.h \
+	heads.h
