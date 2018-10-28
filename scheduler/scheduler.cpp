@@ -1844,10 +1844,11 @@ int main(int argc, char *argv[])
     bool persistent_clients = false;
     int debug_level = Error;
     string logfile;
-    uid_t user_uid;
-    gid_t user_gid;
+    uid_t user_uid;  //当前用的uid
+    gid_t user_gid;  //当前用的gid
     int warn_icecc_user_errno = 0;
 
+    //获取scheduler运行机器icecc的gid和uid
     if (getuid() == 0) {
         struct passwd *pw = getpwnam("icecc");
 
@@ -1863,8 +1864,10 @@ int main(int argc, char *argv[])
         user_uid = getuid();
         user_gid = getgid();
     }
+    
 
     while (true) {
+        //scheduler启动参数的解析
         int option_index = 0;
         static const struct option long_options[] = {
             { "netname", 1, NULL, 'n' },
@@ -1961,21 +1964,21 @@ int main(int argc, char *argv[])
         log_errno("No icecc user on system. Falling back to nobody.", errno);
     }
 
-    if (getuid() == 0) {
-        if (!logfile.size() && detach) {
-            if (mkdir("/var/log/icecc", S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)) {
+    if (getuid() == 0) { //如果当前是root用户
+        if (!logfile.size() && detach) { //如果日志文件不存在，并且是守护进程
+            if (mkdir("/var/log/icecc", S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)) { //创建日志目录
                 if (errno == EEXIST) {
-                    if (-1 == chmod("/var/log/icecc", S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)){
+                    if (-1 == chmod("/var/log/icecc", S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)){ //改变文件或者目录的权限
                         log_perror("chmod() failure");
                     }
 
-                    if (-1 == chown("/var/log/icecc", user_uid, user_gid)){
+                    if (-1 == chown("/var/log/icecc", user_uid, user_gid)){ //改变目录的所有者为当前的用户
                         log_perror("chown() failure");
                     }
                 }
             }
 
-            logfile = "/var/log/icecc/scheduler.log";
+            logfile = "/var/log/icecc/scheduler.log"; //设置日志文件
         }
 
         if (setgroups(0, NULL) < 0) {
@@ -1994,45 +1997,45 @@ int main(int argc, char *argv[])
         }
     }
 
-    setup_debug(debug_level, logfile);
+    setup_debug(debug_level, logfile); //建立日志文件
 
     log_info() << "ICECREAM scheduler " VERSION " starting up, port " << scheduler_port << endl;
 
     if (detach) {
-        if (daemon(0, 0) != 0) {
+        if (daemon(0, 0) != 0) { //设置为守护进程
             log_errno("Failed to detach.", errno);
             exit(1);
         }
     }
 
-    listen_fd = open_tcp_listener(scheduler_port);
+    listen_fd = open_tcp_listener(scheduler_port); //监听一个TCP的文件描述符，端口号为scheduler_port
 
     if (listen_fd < 0) {
         return 1;
     }
 
-    text_fd = open_tcp_listener(scheduler_port + 1);
+    text_fd = open_tcp_listener(scheduler_port + 1); //监听一个TCP的文本文件描述符，端口号为scheduler_port + 1
 
     if (text_fd < 0) {
         return 1;
     }
 
-    broad_fd = open_broad_listener(scheduler_port);
+    broad_fd = open_broad_listener(scheduler_port); //打开广播监听
 
     if (broad_fd < 0) {
         return 1;
     }
 
-    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) { //当父进程结束的时候，不会导致子进程为僵尸进程，而且父进程必须为守护进程
         log_warning() << "signal(SIGPIPE, ignore) failed: " << strerror(errno) << endl;
         return 1;
     }
 
     starttime = time(0);
-    if( getenv( "ICECC_FAKE_STARTTIME" ) != NULL )
+    if( getenv( "ICECC_FAKE_STARTTIME" ) != NULL ) //查看是不是模拟环境
         starttime -= 1000;
 
-    ofstream pidFile;
+    ofstream pidFile; //存储当前的pid file
     string progName = argv[0];
     progName = progName.substr(progName.rfind('/') + 1);
     pidFilePath = string(RUNDIR) + string("/") + progName + string(".pid");
@@ -2048,13 +2051,13 @@ int main(int argc, char *argv[])
 
     time_t next_listen = 0;
 
-    Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime);
+    Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime); //在局域网中发送广播请求
     last_announce = starttime;
 
     while (!exit_main_loop) {
         struct timeval tv;
         tv.tv_usec = 0;
-        tv.tv_sec = prune_servers();
+        tv.tv_sec = prune_servers(); //获取当前链接的有效时间，下一个时间周期中将会清除无效的连接
 
         while (empty_queue()) {
             continue;
@@ -2063,8 +2066,9 @@ int main(int argc, char *argv[])
         /* Announce ourselves from time to time, to make other possible schedulers disconnect
            their daemons if we are the preferred scheduler (daemons with version new enough
            should automatically select the best scheduler, but old daemons connect randomly). */
+        //TO DO 为什么这里要设置为120呢？
         if (last_announce + 120 < time(NULL)) {
-            Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime);
+            Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime); //每隔120ms就广播一次请求
             last_announce = time(NULL);
         }
 

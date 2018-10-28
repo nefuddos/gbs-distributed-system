@@ -1816,7 +1816,7 @@ void GetCSMsg::send_to_channel(MsgChannel *c) const
 
 void UseCSMsg::fill_from_channel(MsgChannel *c)
 {
-    Msg::fill_from_channel(c);
+    Msg::fill_from_chhannel(c);
     *c >> job_id;
     *c >> port;
     *c >> hostname;
